@@ -3,6 +3,7 @@ import json
 import xml.etree.ElementTree as ET
 from datetime import datetime
 from urllib.parse import quote
+from zoneinfo import ZoneInfo
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
@@ -150,15 +151,29 @@ def score_news(headlines):
     return {"score": round(avg_score, 3), "label": label, "items": items}
 
 
+def fetch_live_price(symbol: str):
+    try:
+        info = yf.Ticker(symbol).fast_info
+        for key in ("lastPrice", "regularMarketPrice", "previousClose"):
+            val = info.get(key) if hasattr(info, "get") else getattr(info, key, None)
+            if val is not None and float(val) > 0:
+                return float(val)
+    except Exception:
+        pass
+    return None
+
+
 def run_prediction(market: str, raw_symbol: str, target_days: int = 3, leverage=None, capital=None):
     symbol = normalize_symbol(market, raw_symbol)
     target_days = max(1, min(int(target_days or 3), 15))
 
-    with ThreadPoolExecutor(max_workers=2) as pool:
+    with ThreadPoolExecutor(max_workers=3) as pool:
         hist_fut = pool.submit(yf.download, symbol, period="1y", interval="1d", progress=False, auto_adjust=True)
         news_fut = pool.submit(fetch_news_headlines, symbol, 6)
+        live_fut = pool.submit(fetch_live_price, symbol)
         df = hist_fut.result()
         headlines = news_fut.result()
+        live_price = live_fut.result()
 
     if df is None or df.empty or len(df) < 40:
         raise ValueError(f"找不到 {symbol} 足夠的歷史行情資料，請確認代碼是否正確（例如 BTC-USD、NVDA、2330.TW）。")
@@ -221,7 +236,7 @@ def run_prediction(market: str, raw_symbol: str, target_days: int = 3, leverage=
     news_adj = news_info["score"] * 0.12
     blended_prob = float(np.clip(prob_up + news_adj, 0.05, 0.95))
 
-    last_price = float(close.iloc[-1])
+    last_price = live_price if live_price is not None else float(close.iloc[-1])
     prev_price = float(close.iloc[-2]) if len(close) >= 2 else last_price
     chg_1d_pct = ((last_price - prev_price) / prev_price * 100.0) if prev_price else 0.0
 
@@ -260,12 +275,13 @@ def run_prediction(market: str, raw_symbol: str, target_days: int = 3, leverage=
     rsi_now = float(df["rsi14"].iloc[-1]) if pd.notna(df["rsi14"].iloc[-1]) else 50.0
     ma20_now = float(df["ma20"].iloc[-1]) if pd.notna(df["ma20"].iloc[-1]) else last_price
     ma60_now = float(df["ma60"].iloc[-1]) if pd.notna(df["ma60"].iloc[-1]) else last_price
+    taipei_now = datetime.now(ZoneInfo("Asia/Taipei")).strftime("%Y-%m-%d %H:%M:%S")
 
     return {
         "symbol": symbol,
         "market": market,
         "target_days": target_days,
-        "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "updated_at": taipei_now,
         "last_price": round(last_price, 4),
         "chg_1d_pct": round(chg_1d_pct, 2),
         "direction": direction,
