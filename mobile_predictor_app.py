@@ -39,8 +39,46 @@ MARKET_PRESETS = {
         {"label": "BNB 幣安幣", "symbol": "BNB-USD"},
     ],
     "美股": [
-    {"label": "NVDA 輝達", "symbol": "NVDA"},
-    {"label": "AAPL 蘋果", "symbol": "AAPL"},
-    {"label": "TSLA 特斯拉", "symbol": "TSLA"},
-    {"label": "SPY 標普500", "symbol": "SPY"},
-],
+        {"label": "NVDA 輝達", "symbol": "NVDA"},
+        {"label": "AAPL 蘋果", "symbol": "AAPL"},
+        {"label": "TSLA 特斯拉", "symbol": "TSLA"},
+        {"label": "SPY 標普500", "symbol": "SPY"},
+    ],
+    "台股": [
+        {"label": "2330 台積電", "symbol": "2330.TW"},
+        {"label": "2454 聯發科", "symbol": "2454.TW"},
+        {"label": "0050 元大台灣50", "symbol": "0050.TW"},
+        {"label": "2317 鴻海", "symbol": "2317.TW"},
+    ],
+}
+
+
+def normalize_symbol(market: str, raw_symbol: str) -> str:
+    sym = (raw_symbol or "").strip().upper()
+    if not sym:
+        return "BTC-USD"
+    if market == "加密貨幣":
+        if "-" not in sym and not sym.endswith("USD"):
+            return f"{sym}-USD"
+        return sym
+    if market == "台股":
+        if sym.isdigit():
+            return f"{sym}.TW"
+        return sym
+    return sym
+
+
+def compute_rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    delta = series.diff()
+    gain = delta.clip(lower=0).rolling(period).mean()
+    loss = (-delta.clip(upper=0)).rolling(period).mean()
+    rs = gain / loss.replace(0, np.nan)
+    return 100 - (100 / (1 + rs))
+
+
+def compute_macd(series: pd.Series):
+    ema12 = series.ewm(span=12, adjust=False).mean()
+    ema26 = series.ewm(span=26, adjust=False).mean()
+    macd = ema12 - ema26
+    signal = macd.ewm(span=9, adjust=False).mean()
+    hist = macd - signal
