@@ -42,4 +42,4 @@ MARKET_PRESETS = {
         {"label": "NVDA 輝達", "symbol": "NVDA"},
         {"label": "AAPL 蘋果", "symbol": "AAPL"},
         {"label": "TSLA 特斯拉", "symbol": "TSLA"},
-        {"label": "SPY 標普50
+        {"label": "SPY 標普500", "symbol": "SPY"},
