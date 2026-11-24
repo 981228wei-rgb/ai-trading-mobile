@@ -202,3 +202,33 @@ def run_prediction(market: str, raw_symbol: str, target_days: int = 3, leverage=
     split_idx = int(len(model_df) * 0.8)
     X_train, y_train = model_df[features].iloc[:split_idx], model_df["target"].iloc[:split_idx]
     X_test, y_test = model_df[features].iloc[split_idx:], model_df["target"].iloc[split_idx:]
+    @app.route("/")
+def index():
+    return render_template_string(HTML_PAGE)
+
+@app.route("/healthz")
+def healthz():
+    return jsonify({"status": "ok"})
+
+@app.route("/api/predict", methods=["POST"])
+def api_predict():
+    try:
+        body = request.get_json(force=True) or {}
+        market = body.get("market", "加密貨幣")
+        symbol = body.get("symbol", "BTC-USD")
+        days = int(body.get("days", 3))
+        cap_raw = str(body.get("capital", "")).strip()
+        lev_raw = str(body.get("leverage", "")).strip()
+        cap_val = float(cap_raw) if cap_raw else None
+        lev_val = float(lev_raw) if lev_raw else None
+
+        res = run_prediction(
+            market=market,
+            raw_symbol=symbol,
+            target_days=days,
+            leverage=lev_val,
+            capital=cap_val,
+        )
+        return jsonify(res)
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 400
