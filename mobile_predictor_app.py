@@ -121,7 +121,6 @@ def _parse_rss(feed_url: str, source_tag: str, limit: int = 5):
             pub_el = item.find("pubDate")
             if title_el is not None and title_el.text:
                 raw_title = title_el.text.strip()
-                # 去掉 Google News 常見的 " - 來源名稱" 尾碼讓標題更俐落
                 clean_title = raw_title.rsplit(" - ", 1)[0].strip() if " - " in raw_title else raw_title
                 items.append({
                     "title": f"[{source_tag}] {clean_title}",
@@ -290,4 +289,92 @@ def run_prediction(market: str, raw_symbol: str, target_days: int = 3, leverage=
         direction = "偏空看跌"
         action = "偏空/觀望（控制風險）"
     else:
-        direction = "
+        direction = "震盪中性"
+        action = "觀望或區間試單"
+
+    stop_loss = round(last_price - 1.5 * atr_val, 4)
+    take_profit = round(last_price + 2.2 * atr_val, 4)
+
+    risk_box = None
+    if capital is not None and capital > 0:
+        lev = float(leverage) if (leverage is not None and leverage > 0) else 1.0
+        max_risk_amt = capital * 0.02
+        stop_dist_pct = max(abs(last_price - stop_loss) / last_price, 0.005)
+        suggested_notional = min(capital * lev, max_risk_amt / stop_dist_pct)
+        suggested_units = suggested_notional / last_price if last_price > 0 else 0.0
+        risk_box = {
+            "capital": round(capital, 2),
+            "leverage": round(lev, 2),
+            "max_risk_2pct": round(max_risk_amt, 2),
+            "suggested_notional": round(suggested_notional, 2),
+            "suggested_units": round(suggested_units, 4),
+        }
+
+    rsi_now = float(df["rsi14"].iloc[-1]) if pd.notna(df["rsi14"].iloc[-1]) else 50.0
+    ma20_now = float(df["ma20"].iloc[-1]) if pd.notna(df["ma20"].iloc[-1]) else last_price
+    ma60_now = float(df["ma60"].iloc[-1]) if pd.notna(df["ma60"].iloc[-1]) else last_price
+    taipei_now = datetime.now(ZoneInfo("Asia/Taipei")).strftime("%Y-%m-%d %H:%M:%S")
+
+    return {
+        "symbol": symbol,
+        "market": market,
+        "target_days": target_days,
+        "updated_at": taipei_now,
+        "last_price": round(last_price, 4),
+        "chg_1d_pct": round(chg_1d_pct, 2),
+        "direction": direction,
+        "action": action,
+        "ml_prob_up": round(prob_up * 100, 1),
+        "blended_prob_up": round(blended_prob * 100, 1),
+        "test_accuracy": round(test_acc * 100, 1),
+        "expected_move_pct": round(expected_move_pct, 2),
+        "stop_loss": stop_loss,
+        "take_profit": take_profit,
+        "indicators": {
+            "rsi14": round(rsi_now, 1),
+            "ma20": round(ma20_now, 4),
+            "ma60": round(ma60_now, 4),
+            "atr14": round(atr_val, 4),
+        },
+        "news": news_info,
+        "risk": risk_box,
+    }
+
+
+@app.route("/")
+def index():
+    return render_template("index.html", presets_json=json.dumps(MARKET_PRESETS, ensure_ascii=False))
+
+
+@app.route("/healthz")
+def healthz():
+    return jsonify({"status": "ok"})
+
+
+@app.route("/api/predict", methods=["POST"])
+def api_predict():
+    try:
+        body = request.get_json(force=True) or {}
+        market = body.get("market", "加密貨幣")
+        symbol = body.get("symbol", "BTC-USD")
+        days = int(body.get("days", 3))
+        cap_raw = str(body.get("capital", "")).strip()
+        lev_raw = str(body.get("leverage", "")).strip()
+        cap_val = float(cap_raw) if cap_raw else None
+        lev_val = float(lev_raw) if lev_raw else None
+
+        res = run_prediction(
+            market=market,
+            raw_symbol=symbol,
+            target_days=days,
+            leverage=lev_val,
+            capital=cap_val,
+        )
+        return jsonify(res)
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 400
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", "5000"))
+    app.run(host="0.0.0.0", port=port, debug=False)
