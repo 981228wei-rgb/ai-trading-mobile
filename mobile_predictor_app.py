@@ -201,4 +201,4 @@ def run_prediction(market: str, raw_symbol: str, target_days: int = 3, leverage=
 
     split_idx = int(len(model_df) * 0.8)
     X_train, y_train = model_df[features].iloc[:split_idx], model_df["target"].iloc[:split_idx]
-    X_test, y_test = model_df[features].
+    X_test, y_test = model_df[features].iloc[split_idx:], model_df["target"].iloc[split_idx:]
