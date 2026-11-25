@@ -525,6 +525,19 @@ def run_prediction(market: str, raw_symbol: str, target_days=3, leverage=None, c
         rr_ratio = round(tp_mult / max(stop_mult, 1e-8), 2)
         action = f"觀望為主（盈虧比參考 1:{rr_ratio}，等明確突破再動手）"
 
+    # 評估是否達到「極高勝率推薦」門檻
+    news_score_val = news_info["score"]
+    news_aligned_bull = (blended_prob >= 0.66) and (news_score_val >= -0.10) and (prob_up >= 0.62)
+    news_aligned_bear = (blended_prob <= 0.34) and (news_score_val <= 0.10) and (prob_up <= 0.38)
+    high_win_qualified = (
+        direction in ("偏多看漲", "偏空看跌")
+        and test_acc >= 0.56
+        and rr_ratio >= 1.50
+        and (news_aligned_bull or news_aligned_bear)
+    )
+    prob_edge = abs(blended_prob - 0.50) * 100.0
+    edge_score = round(prob_edge * 1.6 + max(0.0, (test_acc - 0.50) * 100.0) * 1.2 + min(rr_ratio, 3.0) * 4.0, 1)
+
     risk_box = None
     if capital is not None and capital > 0:
         max_risk_amt = capital * profile["max_risk_pct"]
@@ -543,6 +556,7 @@ def run_prediction(market: str, raw_symbol: str, target_days=3, leverage=None, c
 
     taipei_now = datetime.now(ZoneInfo("Asia/Taipei")).strftime("%Y-%m-%d %H:%M:%S")
     days_display = f"{target_days:g}"
+    win_prob_display = round(blended_prob * 100, 1) if direction == "偏多看漲" else round((1.0 - blended_prob) * 100, 1)
 
     return {
         "symbol": symbol,
@@ -556,6 +570,9 @@ def run_prediction(market: str, raw_symbol: str, target_days=3, leverage=None, c
         "action": action,
         "entry_price": entry_price,
         "rr_ratio": rr_ratio,
+        "win_prob_display": win_prob_display,
+        "high_win_qualified": high_win_qualified,
+        "edge_score": edge_score,
         "ml_prob_up": round(prob_up * 100, 1),
         "blended_prob_up": round(blended_prob * 100, 1),
         "test_accuracy": round(test_acc * 100, 1),
@@ -572,6 +589,26 @@ def run_prediction(market: str, raw_symbol: str, target_days=3, leverage=None, c
         "news": news_info,
         "risk": risk_box,
     }
+
+
+def scan_high_win_recommendations(market: str, target_days=3, leverage=None, capital=None, top_n: int = 3):
+    candidates = MARKET_PRESETS.get(market) or []
+    results = []
+    with ThreadPoolExecutor(max_workers=min(4, max(1, len(candidates)))) as pool:
+        futs = [
+            pool.submit(run_prediction, market, item["symbol"], target_days, leverage, capital)
+            for item in candidates
+        ]
+        for fut in futs:
+            try:
+                r = fut.result()
+                if r.get("high_win_qualified"):
+                    results.append(r)
+            except Exception:
+                continue
+
+    results.sort(key=lambda x: x.get("edge_score", 0.0), reverse=True)
+    return results[:top_n]
 
 
 @app.route("/")
@@ -604,6 +641,35 @@ def api_predict():
             capital=cap_val,
         )
         return jsonify(res)
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 400
+
+
+@app.route("/api/recommend", methods=["POST"])
+def api_recommend():
+    try:
+        body = request.get_json(force=True, silent=True) or {}
+        market = body.get("market", "加密貨幣")
+        days = float(body.get("days", 3))
+        cap_raw = str(body.get("capital", "")).strip()
+        lev_raw = str(body.get("leverage", "")).strip()
+        cap_val = float(cap_raw) if cap_raw else None
+        lev_val = float(lev_raw) if lev_raw else None
+
+        recs = scan_high_win_recommendations(
+            market=market,
+            target_days=days,
+            leverage=lev_val,
+            capital=cap_val,
+            top_n=3,
+        )
+        return jsonify({
+            "market": market,
+            "target_days": f"{max(0.05, min(days, 15.0)):g}",
+            "checked_at": datetime.now(ZoneInfo("Asia/Taipei")).strftime("%Y-%m-%d %H:%M:%S"),
+            "criteria": "方向機率 ≥66%（或 ≤34% 且不追低空）＋ 驗證準確 ≥56% ＋ 盈虧比 ≥1.5 ＋ 新聞不打架",
+            "recommendations": recs,
+        })
     except Exception as exc:
         return jsonify({"error": str(exc)}), 400
 
