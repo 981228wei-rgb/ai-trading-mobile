@@ -71,25 +71,25 @@ MARKET_PRESETS = {
 
 TRACK_PROFILES = {
     "加密貨幣": {
-        "track_name": "加密貨幣軌（寬停損・防插針）",
+        "track_name": "加密貨幣軌（結構控損・高盈虧比）",
         "bull_threshold": 0.58,
         "bear_threshold": 0.42,
-        "entry_atr_mult": 0.50,
-        "stop_atr_mult": 2.00,
-        "tp_atr_mult": 2.80,
+        "entry_atr_mult": 0.35,
+        "stop_atr_mult": 1.25,
+        "tp_atr_mult": 2.35,
         "target_ret_min": 0.008,
-        "max_risk_pct": 0.015,
-        "min_stop_pct": 0.015,
+        "max_risk_pct": 0.010,
+        "min_stop_pct": 0.010,
     },
     "股票": {
         "track_name": "股票軌（順均線・控波段）",
         "bull_threshold": 0.55,
         "bear_threshold": 0.45,
-        "entry_atr_mult": 0.35,
-        "stop_atr_mult": 1.40,
-        "tp_atr_mult": 2.10,
+        "entry_atr_mult": 0.30,
+        "stop_atr_mult": 1.15,
+        "tp_atr_mult": 2.00,
         "target_ret_min": 0.003,
-        "max_risk_pct": 0.020,
+        "max_risk_pct": 0.015,
         "min_stop_pct": 0.008,
     },
 }
@@ -398,22 +398,29 @@ def run_prediction(market: str, raw_symbol: str, target_days: int = 3, leverage=
 
     if blended_prob >= profile["bull_threshold"]:
         direction = "偏多看漲"
-        action = f"回測支撐偏多（停損 {stop_mult:.1f} ATR）"
         entry_price = round(min(last_price, last_price - entry_mult * atr_val), 4)
         stop_loss = round(entry_price - stop_mult * atr_val, 4)
         take_profit = round(entry_price + tp_mult * atr_val, 4)
+        risk_per_unit = max(entry_price - stop_loss, 1e-8)
+        reward_per_unit = max(take_profit - entry_price, 0.0)
+        rr_ratio = round(reward_per_unit / risk_per_unit, 2)
+        action = f"回測偏多（停損 {stop_mult:.2f} ATR / 停利 {tp_mult:.2f} ATR，盈虧比 1:{rr_ratio}）"
     elif blended_prob <= profile["bear_threshold"]:
         direction = "偏空看跌"
-        action = f"反彈壓力偏空（停損 {stop_mult:.1f} ATR）"
         entry_price = round(max(last_price, last_price + entry_mult * atr_val), 4)
         stop_loss = round(entry_price + stop_mult * atr_val, 4)
         take_profit = round(entry_price - tp_mult * atr_val, 4)
+        risk_per_unit = max(stop_loss - entry_price, 1e-8)
+        reward_per_unit = max(entry_price - take_profit, 0.0)
+        rr_ratio = round(reward_per_unit / risk_per_unit, 2)
+        action = f"反彈偏空（停損 {stop_mult:.2f} ATR / 停利 {tp_mult:.2f} ATR，盈虧比 1:{rr_ratio}）"
     else:
         direction = "震盪中性"
-        action = "觀望為主，區間高低點輕倉試單"
         entry_price = round(last_price, 4)
         stop_loss = round(last_price - stop_mult * atr_val, 4)
-        take_profit = round(last_price + stop_mult * atr_val, 4)
+        take_profit = round(last_price + tp_mult * atr_val, 4)
+        rr_ratio = round(tp_mult / max(stop_mult, 1e-8), 2)
+        action = f"觀望為主（盈虧比參考 1:{rr_ratio}，等明確突破再動手）"
 
     risk_box = None
     if capital is not None and capital > 0:
@@ -449,6 +456,7 @@ def run_prediction(market: str, raw_symbol: str, target_days: int = 3, leverage=
         "direction": direction,
         "action": action,
         "entry_price": entry_price,
+        "rr_ratio": rr_ratio,
         "ml_prob_up": round(prob_up * 100, 1),
         "blended_prob_up": round(blended_prob * 100, 1),
         "test_accuracy": round(test_acc * 100, 1),
