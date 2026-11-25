@@ -84,6 +84,20 @@ TRACK_PROFILES = {
         "extreme_lev": 5.0,
         "extreme_move_pct": 12.0,
     },
+    "加密貨幣_極短線": {
+        "track_name": "加密貨幣極短線軌（高槓桿・緊停損防洗盤）",
+        "bull_threshold": 0.57,
+        "bear_threshold": 0.43,
+        "entry_atr_mult": 0.20,
+        "stop_atr_mult": 0.85,
+        "tp_atr_mult": 1.65,
+        "target_ret_min": 0.0025,
+        "max_risk_pct": 0.006,
+        "min_stop_pct": 0.004,
+        "extreme_atr_pct": 0.035,
+        "extreme_lev": 10.0,
+        "extreme_move_pct": 6.0,
+    },
     "股票": {
         "track_name": "股票軌（順均線・控波段）",
         "bull_threshold": 0.55,
@@ -101,8 +115,10 @@ TRACK_PROFILES = {
 }
 
 
-def get_track_profile(market: str) -> dict:
+def get_track_profile(market: str, target_days: float) -> dict:
     if market == "加密貨幣":
+        if target_days < 1.0:
+            return TRACK_PROFILES["加密貨幣_極短線"]
         return TRACK_PROFILES["加密貨幣"]
     return TRACK_PROFILES["股票"]
 
@@ -147,7 +163,7 @@ def compute_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     return tr.rolling(period).mean()
 
 
-def analyze_price_structure(df: pd.DataFrame, last_price: float) -> dict:
+def analyze_price_structure(df: pd.DataFrame, last_price: float, range_label: str = "20根K線") -> dict:
     recent = df.tail(20).copy()
     last_bar = df.iloc[-1]
 
@@ -193,7 +209,8 @@ def analyze_price_structure(df: pd.DataFrame, last_price: float) -> dict:
         "high_20": round(high_20, 4),
         "low_20": round(low_20, 4),
         "range_pos_pct": pos_in_range,
-        "summary": f"{ma_structure}｜{candle_signal}｜20日區間位置 {pos_in_range}%",
+        "range_label": range_label,
+        "summary": f"{ma_structure}｜{candle_signal}｜{range_label}區間 {pos_in_range}%",
     }
 
 
@@ -277,16 +294,25 @@ def score_news(headlines):
     return {"score": round(avg_score, 3), "label": label, "items": items}
 
 
-def fetch_history_df(symbol: str) -> pd.DataFrame:
+def fetch_history_df(symbol: str, use_intraday: bool = False) -> pd.DataFrame:
     df = None
+    period = "90d" if use_intraday else "2y"
+    interval = "1h" if use_intraday else "1d"
     try:
-        df = yf.Ticker(symbol).history(period="2y", interval="1d", auto_adjust=True)
+        df = yf.Ticker(symbol).history(period=period, interval=interval, auto_adjust=True)
     except Exception:
         df = None
 
     if df is None or df.empty:
         try:
-            df = yf.download(symbol, period="2y", interval="1d", progress=False, auto_adjust=True, threads=False)
+            df = yf.download(symbol, period=period, interval=interval, progress=False, auto_adjust=True, threads=False)
+        except Exception:
+            df = None
+
+    # 若小時線抓不到，自動退回日線避免報錯
+    if (df is None or df.empty) and use_intraday:
+        try:
+            df = yf.Ticker(symbol).history(period="2y", interval="1d", auto_adjust=True)
         except Exception:
             df = None
 
@@ -328,13 +354,18 @@ def _evaluate_time_series_cv(X: pd.DataFrame, y: pd.Series) -> float:
     return float(np.mean(scores)) if scores else 0.5
 
 
-def run_prediction(market: str, raw_symbol: str, target_days: int = 3, leverage=None, capital=None):
-    profile = get_track_profile(market)
+def run_prediction(market: str, raw_symbol: str, target_days=3, leverage=None, capital=None):
+    raw_days = float(target_days if target_days is not None else 3)
+    target_days = max(0.05, min(raw_days, 15.0))
+    profile = get_track_profile(market, target_days)
     symbol = normalize_symbol(market, raw_symbol)
-    target_days = max(1, min(int(target_days or 3), 15))
+
+    is_intraday_scalp = (market == "加密貨幣" and target_days < 1.0)
+    # 0.1 天 ≈ 2.4 小時，換算為 1h K 線的步數（至少 2 根）
+    horizon_steps = max(2, int(round(target_days * 24))) if is_intraday_scalp else max(1, int(round(target_days)))
 
     with ThreadPoolExecutor(max_workers=3) as pool:
-        hist_fut = pool.submit(fetch_history_df, symbol)
+        hist_fut = pool.submit(fetch_history_df, symbol, is_intraday_scalp)
         news_fut = pool.submit(fetch_news_headlines, symbol, 8)
         live_fut = pool.submit(fetch_live_price, symbol)
         df = hist_fut.result()
@@ -352,7 +383,7 @@ def run_prediction(market: str, raw_symbol: str, target_days: int = 3, leverage=
 
     df = df[["Open", "High", "Low", "Close", "Volume"]].dropna(subset=["Open", "High", "Low", "Close"]).copy()
     if len(df) < 60:
-        raise ValueError(f"{symbol} 有效交易日資料不足。")
+        raise ValueError(f"{symbol} 有效K線資料不足。")
 
     close = df["Close"]
     vol = df["Volume"].replace(0, np.nan)
@@ -375,7 +406,7 @@ def run_prediction(market: str, raw_symbol: str, target_days: int = 3, leverage=
     df["atr14"] = compute_atr(df, 14)
     df["atr_pct"] = df["atr14"] / close.replace(0, np.nan)
 
-    df["future_ret"] = close.shift(-target_days) / close - 1.0
+    df["future_ret"] = close.shift(-horizon_steps) / close - 1.0
     df["target"] = (df["future_ret"] > profile["target_ret_min"]).astype(int)
 
     features = [
@@ -413,19 +444,19 @@ def run_prediction(market: str, raw_symbol: str, target_days: int = 3, leverage=
     prev_price = float(close.iloc[-2]) if len(close) >= 2 else last_price
     chg_1d_pct = ((last_price - prev_price) / prev_price * 100.0) if prev_price else 0.0
 
-    structure_info = analyze_price_structure(df, last_price)
+    range_label = "20根1h" if is_intraday_scalp else "20日"
+    structure_info = analyze_price_structure(df, last_price, range_label=range_label)
     rsi_now = float(df["rsi14"].iloc[-1]) if pd.notna(df["rsi14"].iloc[-1]) else 50.0
     ma20_now = float(df["ma20"].iloc[-1]) if pd.notna(df["ma20"].iloc[-1]) else last_price
     ma60_now = float(df["ma60"].iloc[-1]) if pd.notna(df["ma60"].iloc[-1]) else last_price
 
-    atr_val = float(df["atr14"].iloc[-1]) if pd.notna(df["atr14"].iloc[-1]) else last_price * 0.02
+    atr_val = float(df["atr14"].iloc[-1]) if pd.notna(df["atr14"].iloc[-1]) else last_price * 0.01
     atr_pct_now = atr_val / max(last_price, 1e-8)
-    vol_val = float(df["vol_20"].iloc[-1]) if pd.notna(df["vol_20"].iloc[-1]) else 0.02
-    expected_move_pct = float(vol_val * np.sqrt(target_days) * 100.0)
+    vol_val = float(df["vol_20"].iloc[-1]) if pd.notna(df["vol_20"].iloc[-1]) else 0.01
+    expected_move_pct = float(vol_val * np.sqrt(horizon_steps) * 100.0)
 
     lev_val = float(leverage) if (leverage is not None and leverage > 0) else 1.0
 
-    # 嚴格門檻：僅在「極端高風險」或「完全無法判斷走勢（訊號互打架＋低準確＋50%死區）」時建議先不做單
     extreme_high_risk = (
         atr_pct_now >= profile["extreme_atr_pct"]
         and (lev_val >= profile["extreme_lev"] or abs(chg_1d_pct) >= profile["extreme_move_pct"])
@@ -444,7 +475,7 @@ def run_prediction(market: str, raw_symbol: str, target_days: int = 3, leverage=
     low_zone_no_short = (
         structure_info["range_pos_pct"] <= 20.0
         or rsi_now <= 35.0
-        or chg_1d_pct >= 5.0
+        or chg_1d_pct >= (2.5 if is_intraday_scalp else 5.0)
     )
 
     if extreme_high_risk or indecisive_conflict:
@@ -454,9 +485,9 @@ def run_prediction(market: str, raw_symbol: str, target_days: int = 3, leverage=
         take_profit = round(last_price + tp_mult * atr_val, 4)
         rr_ratio = round(tp_mult / max(stop_mult, 1e-8), 2)
         if extreme_high_risk:
-            action = "波動與風險處於極端高檔，建議先空手觀望，不硬做單"
+            action = "極短線波動與槓桿風險過高，建議先空手觀望，不硬做單"
         else:
-            action = "模型機率卡在五五波、驗證偏弱且消息與技術互打架，建議先不做單"
+            action = "訊號處於五五波與多空拉鋸，建議先不做單"
     elif blended_prob >= profile["bull_threshold"]:
         direction = "偏多看漲"
         entry_price = round(min(last_price, last_price - entry_mult * atr_val), 4)
@@ -465,7 +496,7 @@ def run_prediction(market: str, raw_symbol: str, target_days: int = 3, leverage=
         risk_per_unit = max(entry_price - stop_loss, 1e-8)
         reward_per_unit = max(take_profit - entry_price, 0.0)
         rr_ratio = round(reward_per_unit / risk_per_unit, 2)
-        action = f"回測偏多（停損 {stop_mult:.2f} ATR / 停利 {tp_mult:.2f} ATR，盈虧比 1:{rr_ratio}）"
+        action = f"極短線回測偏多（停損 {stop_mult:.2f} ATR / 停利 {tp_mult:.2f} ATR，盈虧比 1:{rr_ratio}）"
     elif blended_prob <= profile["bear_threshold"] and not low_zone_no_short:
         direction = "偏空看跌"
         entry_price = round(max(last_price, last_price + entry_mult * atr_val), 4)
@@ -474,7 +505,7 @@ def run_prediction(market: str, raw_symbol: str, target_days: int = 3, leverage=
         risk_per_unit = max(stop_loss - entry_price, 1e-8)
         reward_per_unit = max(entry_price - take_profit, 0.0)
         rr_ratio = round(reward_per_unit / risk_per_unit, 2)
-        action = f"反彈偏空（停損 {stop_mult:.2f} ATR / 停利 {tp_mult:.2f} ATR，盈虧比 1:{rr_ratio}）"
+        action = f"極短線反彈偏空（停損 {stop_mult:.2f} ATR / 停利 {tp_mult:.2f} ATR，盈虧比 1:{rr_ratio}）"
     elif blended_prob <= profile["bear_threshold"] and low_zone_no_short:
         direction = "低點防反彈（不追空）"
         entry_price = round(last_price, 4)
@@ -507,12 +538,13 @@ def run_prediction(market: str, raw_symbol: str, target_days: int = 3, leverage=
         }
 
     taipei_now = datetime.now(ZoneInfo("Asia/Taipei")).strftime("%Y-%m-%d %H:%M:%S")
+    days_display = f"{target_days:g}"
 
     return {
         "symbol": symbol,
         "market": market,
         "track_name": profile["track_name"],
-        "target_days": target_days,
+        "target_days": days_display,
         "updated_at": taipei_now,
         "last_price": round(last_price, 4),
         "chg_1d_pct": round(chg_1d_pct, 2),
@@ -554,7 +586,7 @@ def api_predict():
         body = request.get_json(force=True, silent=True) or {}
         market = body.get("market", "加密貨幣")
         symbol = body.get("symbol", "BTC-USD")
-        days = int(body.get("days", 3))
+        days = float(body.get("days", 3))
         cap_raw = str(body.get("capital", "")).strip()
         lev_raw = str(body.get("leverage", "")).strip()
         cap_val = float(cap_raw) if cap_raw else None
