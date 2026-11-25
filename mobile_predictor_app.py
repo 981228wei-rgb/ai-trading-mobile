@@ -507,9 +507,15 @@ def run_prediction(market: str, raw_symbol: str, target_days=3, leverage=None, c
     elif blended_prob <= profile["bear_threshold"] and low_zone_no_short:
         direction = "低點防反彈（不追空）"
         entry_price = round(last_price, 4)
-        stop_loss = round(max(structure_info["low_20"], last_price - stop_mult * atr_val), 4)
+        min_buf = max(stop_mult * atr_val, last_price * profile["min_stop_pct"])
+        raw_stop = min(last_price - min_buf, structure_info["low_20"] - 0.25 * atr_val)
+        stop_loss = round(max(raw_stop, last_price - max(stop_mult * 1.25, 1.0) * atr_val), 4)
+        if stop_loss >= entry_price:
+            stop_loss = round(entry_price - min_buf, 4)
         take_profit = round(last_price + tp_mult * atr_val, 4)
-        rr_ratio = round(tp_mult / max(stop_mult, 1e-8), 2)
+        risk_per_unit = max(entry_price - stop_loss, 1e-8)
+        reward_per_unit = max(take_profit - entry_price, 0.0)
+        rr_ratio = round(reward_per_unit / risk_per_unit, 2)
         action = "處於低位/超賣或急拉區，禁止低點追空，等反彈遇阻再看"
     else:
         direction = "震盪中性"
