@@ -638,10 +638,11 @@ def run_backtest(market: str, raw_symbol: str, target_days=3, leverage=None):
     horizon_steps = max(2, int(round(target_days * 24))) if is_intraday_scalp else max(1, int(round(target_days)))
     lev_val = float(leverage) if (leverage is not None and leverage > 0) else 1.0
     fee_cost = profile["fee_rate"] * 2.0
+    backtest_days = 30
 
     df = fetch_history_df(symbol, is_intraday_scalp)
-    if df is None or df.empty or len(df) < 120:
-        raise ValueError(f"{symbol} 歷史 K 線不足，無法執行回測。")
+    if df is None or df.empty or len(df) < 90:
+        raise ValueError(f"{symbol} 歷史 K 線不足，無法執行 30 天回測。")
 
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
@@ -651,15 +652,27 @@ def run_backtest(market: str, raw_symbol: str, target_days=3, leverage=None):
     df = df[["Open", "High", "Low", "Close", "Volume"]].dropna(subset=["Open", "High", "Low", "Close"]).copy()
     feat_df = _build_feature_df(df, horizon_steps, profile["target_ret_min"]).dropna(subset=FEATURE_COLS + ["target"]).copy()
     n_rows = len(feat_df)
-    if n_rows < 90:
+    if n_rows < 75:
         raise ValueError(f"{symbol} 有效回測樣本不足。")
 
-    start_idx = max(60, int(n_rows * 0.55))
-    step_stride = 2 if (is_intraday_scalp and (n_rows - start_idx) > 260) else 1
+    end_ts = feat_df.index[-1]
+    cutoff_ts = end_ts - pd.Timedelta(days=backtest_days)
+    window_candidates = np.where(feat_df.index >= cutoff_ts)[0]
+    if len(window_candidates) == 0:
+        window_candidates = np.arange(max(50, n_rows - 30), n_rows)
+
+    start_idx = max(50, int(window_candidates[0]))
+    stop_idx = max(start_idx + 1, n_rows - horizon_steps)
+    if start_idx >= stop_idx:
+        raise ValueError(f"{symbol} 最近 30 天可結算的 K 線不足。")
+
+    step_stride = 2 if (is_intraday_scalp and (stop_idx - start_idx) > 260) else 1
+    window_start_str = str(feat_df.index[start_idx])[:16]
+    window_end_str = str(feat_df.index[min(stop_idx, n_rows - 1)])[:16]
 
     trades = []
     signals_evaluated = 0
-    for idx in range(start_idx, n_rows - horizon_steps, step_stride):
+    for idx in range(start_idx, stop_idx, step_stride):
         train_slice = feat_df.iloc[:idx]
         if len(train_slice) < 50:
             continue
@@ -739,15 +752,17 @@ def run_backtest(market: str, raw_symbol: str, target_days=3, leverage=None):
             "symbol": symbol,
             "market": market,
             "target_days": f"{target_days:g}",
+            "backtest_days": backtest_days,
+            "window_range": f"{window_start_str} ～ {window_end_str}",
             "leverage": round(lev_val, 2),
-            "timeframe": "1h K線（模擬極短線）" if is_intraday_scalp else "1d 日線",
+            "timeframe": "1h K線（近30天極短線）" if is_intraday_scalp else "1d 日線（近30天）",
             "bars_tested": signals_evaluated,
             "trade_count": 0,
             "win_rate_pct": 0.0,
             "avg_return_pct": 0.0,
             "profit_factor": 0.0,
             "max_drawdown_pct": 0.0,
-            "note": "回測期間內符合進場條件的訊號較少，建議換標的或調整天數再測。",
+            "note": f"近 30 天（{window_start_str} ～ {window_end_str}）內符合進場條件的訊號較少。",
         }
 
     arr = np.array(trades, dtype=float)
@@ -769,15 +784,17 @@ def run_backtest(market: str, raw_symbol: str, target_days=3, leverage=None):
         "symbol": symbol,
         "market": market,
         "target_days": f"{target_days:g}",
+        "backtest_days": backtest_days,
+        "window_range": f"{window_start_str} ～ {window_end_str}",
         "leverage": round(lev_val, 2),
-        "timeframe": "1h K線（模擬極短線）" if is_intraday_scalp else "1d 日線",
+        "timeframe": "1h K線（近30天極短線）" if is_intraday_scalp else "1d 日線（近30天）",
         "bars_tested": signals_evaluated,
         "trade_count": int(len(arr)),
         "win_rate_pct": win_rate,
         "avg_return_pct": avg_ret,
         "profit_factor": profit_factor,
         "max_drawdown_pct": max_dd_pct,
-        "note": f"已含雙邊手續費估算（{fee_cost * 100:.2f}%）與 {lev_val:g}x 槓桿放大。",
+        "note": f"回測區間：{window_start_str} ～ {window_end_str}（近{backtest_days}天，含雙邊手續費 {fee_cost * 100:.2f}% 與 {lev_val:g}x 槓桿）。",
     }
 
 
