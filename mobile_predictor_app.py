@@ -83,6 +83,7 @@ TRACK_PROFILES = {
         "extreme_atr_pct": 0.085,
         "extreme_lev": 5.0,
         "extreme_move_pct": 12.0,
+        "fee_rate": 0.0005,
     },
     "加密貨幣_極短線": {
         "track_name": "加密貨幣極短線軌（高槓桿・緊停損防洗盤）",
@@ -97,6 +98,7 @@ TRACK_PROFILES = {
         "extreme_atr_pct": 0.035,
         "extreme_lev": 10.0,
         "extreme_move_pct": 6.0,
+        "fee_rate": 0.0006,
     },
     "股票": {
         "track_name": "股票軌（順均線・控波段）",
@@ -111,6 +113,7 @@ TRACK_PROFILES = {
         "extreme_atr_pct": 0.065,
         "extreme_lev": 3.0,
         "extreme_move_pct": 10.0,
+        "fee_rate": 0.0005,
     },
 }
 
@@ -330,6 +333,41 @@ def fetch_live_price(symbol: str):
     return None
 
 
+def _build_feature_df(df: pd.DataFrame, horizon_steps: int, target_ret_min: float) -> pd.DataFrame:
+    out = df.copy()
+    close = out["Close"]
+    vol = out["Volume"].replace(0, np.nan)
+    vol_ma20 = vol.rolling(20).mean()
+
+    out["ret_1d"] = close.pct_change()
+    out["ret_3d"] = close.pct_change(3)
+    out["ret_5d"] = close.pct_change(5)
+    out["ma10"] = close.rolling(10).mean()
+    out["ma20"] = close.rolling(20).mean()
+    out["ma60"] = close.rolling(60).mean()
+    out["ma10_gap"] = (close - out["ma10"]) / out["ma10"].replace(0, np.nan)
+    out["ma20_gap"] = (close - out["ma20"]) / out["ma20"].replace(0, np.nan)
+    out["ma20_slope"] = out["ma20"].pct_change(3)
+    out["rsi14"] = compute_rsi(close, 14)
+    _, _, hist = compute_macd(close)
+    out["macd_hist"] = hist / close.replace(0, np.nan)
+    out["vol_20"] = out["ret_1d"].rolling(20).std()
+    out["vol_ratio"] = (vol / vol_ma20).clip(0.1, 5.0).fillna(1.0)
+    out["atr14"] = compute_atr(out, 14)
+    out["atr_pct"] = out["atr14"] / close.replace(0, np.nan)
+
+    out["future_ret"] = close.shift(-horizon_steps) / close - 1.0
+    out["target"] = (out["future_ret"] > target_ret_min).astype(int)
+    return out
+
+
+FEATURE_COLS = [
+    "ret_1d", "ret_3d", "ret_5d",
+    "ma10_gap", "ma20_gap", "ma20_slope",
+    "rsi14", "macd_hist", "vol_20", "vol_ratio", "atr_pct"
+]
+
+
 def _evaluate_time_series_cv(X: pd.DataFrame, y: pd.Series) -> float:
     n_samples = len(X)
     if n_samples < 60:
@@ -351,6 +389,94 @@ def _evaluate_time_series_cv(X: pd.DataFrame, y: pd.Series) -> float:
         preds = m.predict(X.iloc[val_idx])
         scores.append(float(accuracy_score(y.iloc[val_idx], preds)))
     return float(np.mean(scores)) if scores else 0.5
+
+
+def _decide_signal(
+    profile: dict,
+    prob_up: float,
+    blended_prob: float,
+    test_acc: float,
+    news_score: float,
+    last_price: float,
+    prev_price: float,
+    atr_val: float,
+    rsi_now: float,
+    range_pos_pct: float,
+    low_20: float,
+    lev_val: float,
+    is_intraday_scalp: bool,
+):
+    chg_pct = ((last_price - prev_price) / prev_price * 100.0) if prev_price else 0.0
+    atr_pct_now = atr_val / max(last_price, 1e-8)
+
+    extreme_high_risk = (
+        atr_pct_now >= profile["extreme_atr_pct"]
+        and (lev_val >= profile["extreme_lev"] or abs(chg_pct) >= profile["extreme_move_pct"])
+    )
+    indecisive_conflict = (
+        abs(blended_prob - 0.50) <= 0.03
+        and test_acc < 0.48
+        and abs(news_score) >= 0.25
+        and ((news_score > 0 and prob_up < 0.48) or (news_score < 0 and prob_up > 0.52))
+    )
+
+    entry_mult = profile["entry_atr_mult"]
+    stop_mult = profile["stop_atr_mult"]
+    tp_mult = profile["tp_atr_mult"]
+
+    low_zone_no_short = (
+        range_pos_pct <= 20.0
+        or rsi_now <= 35.0
+        or chg_pct >= (2.5 if is_intraday_scalp else 5.0)
+    )
+
+    if extreme_high_risk or indecisive_conflict:
+        direction = "建議先不做單"
+        entry_price = round(last_price, 4)
+        stop_loss = round(last_price - stop_mult * atr_val, 4)
+        take_profit = round(last_price + tp_mult * atr_val, 4)
+        rr_ratio = round(tp_mult / max(stop_mult, 1e-8), 2)
+        action = "極短線波動與槓桿風險過高，建議先空手觀望，不硬做單" if extreme_high_risk else "訊號處於五五波與多空拉鋸，建議先不做單"
+    elif blended_prob >= profile["bull_threshold"]:
+        direction = "偏多看漲"
+        entry_price = round(min(last_price, last_price - entry_mult * atr_val), 4)
+        stop_loss = round(entry_price - stop_mult * atr_val, 4)
+        take_profit = round(entry_price + tp_mult * atr_val, 4)
+        risk_per_unit = max(entry_price - stop_loss, 1e-8)
+        reward_per_unit = max(take_profit - entry_price, 0.0)
+        rr_ratio = round(reward_per_unit / risk_per_unit, 2)
+        action = f"極短線回測偏多（停損 {stop_mult:.2f} ATR / 停利 {tp_mult:.2f} ATR，盈虧比 1:{rr_ratio}）"
+    elif blended_prob <= profile["bear_threshold"] and not low_zone_no_short:
+        direction = "偏空看跌"
+        entry_price = round(max(last_price, last_price + entry_mult * atr_val), 4)
+        stop_loss = round(entry_price + stop_mult * atr_val, 4)
+        take_profit = round(entry_price - tp_mult * atr_val, 4)
+        risk_per_unit = max(stop_loss - entry_price, 1e-8)
+        reward_per_unit = max(entry_price - take_profit, 0.0)
+        rr_ratio = round(reward_per_unit / risk_per_unit, 2)
+        action = f"極短線反彈偏空（停損 {stop_mult:.2f} ATR / 停利 {tp_mult:.2f} ATR，盈虧比 1:{rr_ratio}）"
+    elif blended_prob <= profile["bear_threshold"] and low_zone_no_short:
+        direction = "低點防反彈（不追空）"
+        entry_price = round(last_price, 4)
+        min_buf = max(stop_mult * atr_val, last_price * profile["min_stop_pct"])
+        raw_stop = min(last_price - min_buf, low_20 - 0.25 * atr_val)
+        stop_loss = round(max(raw_stop, last_price - max(stop_mult * 1.25, 1.0) * atr_val), 4)
+        if stop_loss >= entry_price:
+            stop_loss = round(entry_price - min_buf, 4)
+        take_profit = round(last_price + tp_mult * atr_val, 4)
+        risk_per_unit = max(entry_price - stop_loss, 1e-8)
+        reward_per_unit = max(take_profit - entry_price, 0.0)
+        rr_ratio = round(reward_per_unit / risk_per_unit, 2)
+        action = "處於低位/超賣或急拉區，禁止低點追空，等反彈遇阻再看"
+    else:
+        direction = "震盪中性"
+        entry_price = round(last_price, 4)
+        stop_loss = round(last_price - stop_mult * atr_val, 4)
+        take_profit = round(last_price + tp_mult * atr_val, 4)
+        rr_ratio = round(tp_mult / max(stop_mult, 1e-8), 2)
+        action = f"觀望為主（盈虧比參考 1:{rr_ratio}，等明確突破再動手）"
+
+    return direction, action, entry_price, stop_loss, take_profit, rr_ratio, chg_pct
 
 
 def run_prediction(market: str, raw_symbol: str, target_days=3, leverage=None, capital=None):
@@ -383,43 +509,13 @@ def run_prediction(market: str, raw_symbol: str, target_days=3, leverage=None, c
     if len(df) < 60:
         raise ValueError(f"{symbol} 有效K線資料不足。")
 
-    close = df["Close"]
-    vol = df["Volume"].replace(0, np.nan)
-    vol_ma20 = vol.rolling(20).mean()
-
-    df["ret_1d"] = close.pct_change()
-    df["ret_3d"] = close.pct_change(3)
-    df["ret_5d"] = close.pct_change(5)
-    df["ma10"] = close.rolling(10).mean()
-    df["ma20"] = close.rolling(20).mean()
-    df["ma60"] = close.rolling(60).mean()
-    df["ma10_gap"] = (close - df["ma10"]) / df["ma10"].replace(0, np.nan)
-    df["ma20_gap"] = (close - df["ma20"]) / df["ma20"].replace(0, np.nan)
-    df["ma20_slope"] = df["ma20"].pct_change(3)
-    df["rsi14"] = compute_rsi(close, 14)
-    macd, signal, hist = compute_macd(close)
-    df["macd_hist"] = hist / close.replace(0, np.nan)
-    df["vol_20"] = df["ret_1d"].rolling(20).std()
-    df["vol_ratio"] = (vol / vol_ma20).clip(0.1, 5.0).fillna(1.0)
-    df["atr14"] = compute_atr(df, 14)
-    df["atr_pct"] = df["atr14"] / close.replace(0, np.nan)
-
-    df["future_ret"] = close.shift(-horizon_steps) / close - 1.0
-    df["target"] = (df["future_ret"] > profile["target_ret_min"]).astype(int)
-
-    features = [
-        "ret_1d", "ret_3d", "ret_5d",
-        "ma10_gap", "ma20_gap", "ma20_slope",
-        "rsi14", "macd_hist", "vol_20", "vol_ratio", "atr_pct"
-    ]
-
-    model_df = df.dropna(subset=features + ["target"]).copy()
+    feat_df = _build_feature_df(df, horizon_steps, profile["target_ret_min"])
+    model_df = feat_df.dropna(subset=FEATURE_COLS + ["target"]).copy()
     if len(model_df) < 50:
         raise ValueError("可訓練樣本數不足，請嘗試其他標的。")
 
-    X_all = model_df[features]
+    X_all = model_df[FEATURE_COLS]
     y_all = model_df["target"]
-
     test_acc = _evaluate_time_series_cv(X_all, y_all)
 
     clf = RandomForestClassifier(
@@ -431,101 +527,43 @@ def run_prediction(market: str, raw_symbol: str, target_days=3, leverage=None, c
     )
     clf.fit(X_all, y_all)
 
-    latest_row = df[features].iloc[[-1]].ffill().bfill()
+    latest_row = feat_df[FEATURE_COLS].iloc[[-1]].ffill().bfill()
     prob_up = float(clf.predict_proba(latest_row)[0][1])
 
     news_info = score_news(headlines)
     news_adj = news_info["score"] * 0.08 if abs(news_info["score"]) >= 0.15 else 0.0
     blended_prob = float(np.clip(prob_up + news_adj, 0.08, 0.92))
 
-    last_price = live_price if live_price is not None else float(close.iloc[-1])
-    prev_price = float(close.iloc[-2]) if len(close) >= 2 else last_price
-    chg_1d_pct = ((last_price - prev_price) / prev_price * 100.0) if prev_price else 0.0
+    last_price = live_price if live_price is not None else float(feat_df["Close"].iloc[-1])
+    prev_price = float(feat_df["Close"].iloc[-2]) if len(feat_df) >= 2 else last_price
 
     range_label = "20根1h" if is_intraday_scalp else "20日"
-    structure_info = analyze_price_structure(df, last_price, range_label=range_label)
-    rsi_now = float(df["rsi14"].iloc[-1]) if pd.notna(df["rsi14"].iloc[-1]) else 50.0
-    ma20_now = float(df["ma20"].iloc[-1]) if pd.notna(df["ma20"].iloc[-1]) else last_price
-    ma60_now = float(df["ma60"].iloc[-1]) if pd.notna(df["ma60"].iloc[-1]) else last_price
+    structure_info = analyze_price_structure(feat_df, last_price, range_label=range_label)
+    rsi_now = float(feat_df["rsi14"].iloc[-1]) if pd.notna(feat_df["rsi14"].iloc[-1]) else 50.0
+    ma20_now = float(feat_df["ma20"].iloc[-1]) if pd.notna(feat_df["ma20"].iloc[-1]) else last_price
+    ma60_now = float(feat_df["ma60"].iloc[-1]) if pd.notna(feat_df["ma60"].iloc[-1]) else last_price
 
-    atr_val = float(df["atr14"].iloc[-1]) if pd.notna(df["atr14"].iloc[-1]) else last_price * 0.01
-    atr_pct_now = atr_val / max(last_price, 1e-8)
-    vol_val = float(df["vol_20"].iloc[-1]) if pd.notna(df["vol_20"].iloc[-1]) else 0.01
+    atr_val = float(feat_df["atr14"].iloc[-1]) if pd.notna(feat_df["atr14"].iloc[-1]) else last_price * 0.01
+    vol_val = float(feat_df["vol_20"].iloc[-1]) if pd.notna(feat_df["vol_20"].iloc[-1]) else 0.01
     expected_move_pct = float(vol_val * np.sqrt(horizon_steps) * 100.0)
-
     lev_val = float(leverage) if (leverage is not None and leverage > 0) else 1.0
 
-    extreme_high_risk = (
-        atr_pct_now >= profile["extreme_atr_pct"]
-        and (lev_val >= profile["extreme_lev"] or abs(chg_1d_pct) >= profile["extreme_move_pct"])
-    )
-    indecisive_conflict = (
-        abs(blended_prob - 0.50) <= 0.03
-        and test_acc < 0.48
-        and abs(news_info["score"]) >= 0.25
-        and ((news_info["score"] > 0 and prob_up < 0.48) or (news_info["score"] < 0 and prob_up > 0.52))
-    )
-
-    entry_mult = profile["entry_atr_mult"]
-    stop_mult = profile["stop_atr_mult"]
-    tp_mult = profile["tp_atr_mult"]
-
-    low_zone_no_short = (
-        structure_info["range_pos_pct"] <= 20.0
-        or rsi_now <= 35.0
-        or chg_1d_pct >= (2.5 if is_intraday_scalp else 5.0)
+    direction, action, entry_price, stop_loss, take_profit, rr_ratio, chg_1d_pct = _decide_signal(
+        profile=profile,
+        prob_up=prob_up,
+        blended_prob=blended_prob,
+        test_acc=test_acc,
+        news_score=news_info["score"],
+        last_price=last_price,
+        prev_price=prev_price,
+        atr_val=atr_val,
+        rsi_now=rsi_now,
+        range_pos_pct=structure_info["range_pos_pct"],
+        low_20=structure_info["low_20"],
+        lev_val=lev_val,
+        is_intraday_scalp=is_intraday_scalp,
     )
 
-    if extreme_high_risk or indecisive_conflict:
-        direction = "建議先不做單"
-        entry_price = round(last_price, 4)
-        stop_loss = round(last_price - stop_mult * atr_val, 4)
-        take_profit = round(last_price + tp_mult * atr_val, 4)
-        rr_ratio = round(tp_mult / max(stop_mult, 1e-8), 2)
-        if extreme_high_risk:
-            action = "極短線波動與槓桿風險過高，建議先空手觀望，不硬做單"
-        else:
-            action = "訊號處於五五波與多空拉鋸，建議先不做單"
-    elif blended_prob >= profile["bull_threshold"]:
-        direction = "偏多看漲"
-        entry_price = round(min(last_price, last_price - entry_mult * atr_val), 4)
-        stop_loss = round(entry_price - stop_mult * atr_val, 4)
-        take_profit = round(entry_price + tp_mult * atr_val, 4)
-        risk_per_unit = max(entry_price - stop_loss, 1e-8)
-        reward_per_unit = max(take_profit - entry_price, 0.0)
-        rr_ratio = round(reward_per_unit / risk_per_unit, 2)
-        action = f"極短線回測偏多（停損 {stop_mult:.2f} ATR / 停利 {tp_mult:.2f} ATR，盈虧比 1:{rr_ratio}）"
-    elif blended_prob <= profile["bear_threshold"] and not low_zone_no_short:
-        direction = "偏空看跌"
-        entry_price = round(max(last_price, last_price + entry_mult * atr_val), 4)
-        stop_loss = round(entry_price + stop_mult * atr_val, 4)
-        take_profit = round(entry_price - tp_mult * atr_val, 4)
-        risk_per_unit = max(stop_loss - entry_price, 1e-8)
-        reward_per_unit = max(entry_price - take_profit, 0.0)
-        rr_ratio = round(reward_per_unit / risk_per_unit, 2)
-        action = f"極短線反彈偏空（停損 {stop_mult:.2f} ATR / 停利 {tp_mult:.2f} ATR，盈虧比 1:{rr_ratio}）"
-    elif blended_prob <= profile["bear_threshold"] and low_zone_no_short:
-        direction = "低點防反彈（不追空）"
-        entry_price = round(last_price, 4)
-        min_buf = max(stop_mult * atr_val, last_price * profile["min_stop_pct"])
-        raw_stop = min(last_price - min_buf, structure_info["low_20"] - 0.25 * atr_val)
-        stop_loss = round(max(raw_stop, last_price - max(stop_mult * 1.25, 1.0) * atr_val), 4)
-        if stop_loss >= entry_price:
-            stop_loss = round(entry_price - min_buf, 4)
-        take_profit = round(last_price + tp_mult * atr_val, 4)
-        risk_per_unit = max(entry_price - stop_loss, 1e-8)
-        reward_per_unit = max(take_profit - entry_price, 0.0)
-        rr_ratio = round(reward_per_unit / risk_per_unit, 2)
-        action = "處於低位/超賣或急拉區，禁止低點追空，等反彈遇阻再看"
-    else:
-        direction = "震盪中性"
-        entry_price = round(last_price, 4)
-        stop_loss = round(last_price - stop_mult * atr_val, 4)
-        take_profit = round(last_price + tp_mult * atr_val, 4)
-        rr_ratio = round(tp_mult / max(stop_mult, 1e-8), 2)
-        action = f"觀望為主（盈虧比參考 1:{rr_ratio}，等明確突破再動手）"
-
-    # 評估是否達到「極高勝率推薦」門檻
     news_score_val = news_info["score"]
     news_aligned_bull = (blended_prob >= 0.66) and (news_score_val >= -0.10) and (prob_up >= 0.62)
     news_aligned_bear = (blended_prob <= 0.34) and (news_score_val <= 0.10) and (prob_up <= 0.38)
@@ -588,6 +626,158 @@ def run_prediction(market: str, raw_symbol: str, target_days=3, leverage=None, c
         "structure": structure_info,
         "news": news_info,
         "risk": risk_box,
+    }
+
+
+def run_backtest(market: str, raw_symbol: str, target_days=3, leverage=None):
+    raw_days = float(target_days if target_days is not None else 3)
+    target_days = max(0.05, min(raw_days, 15.0))
+    profile = get_track_profile(market, target_days)
+    symbol = normalize_symbol(market, raw_symbol)
+    is_intraday_scalp = (market == "加密貨幣" and target_days < 1.0)
+    horizon_steps = max(2, int(round(target_days * 24))) if is_intraday_scalp else max(1, int(round(target_days)))
+    lev_val = float(leverage) if (leverage is not None and leverage > 0) else 1.0
+    fee_cost = profile["fee_rate"] * 2.0
+
+    df = fetch_history_df(symbol, is_intraday_scalp)
+    if df is None or df.empty or len(df) < 120:
+        raise ValueError(f"{symbol} 歷史 K 線不足，無法執行回測。")
+
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    if "Volume" not in df.columns:
+        df["Volume"] = 0.0
+
+    df = df[["Open", "High", "Low", "Close", "Volume"]].dropna(subset=["Open", "High", "Low", "Close"]).copy()
+    feat_df = _build_feature_df(df, horizon_steps, profile["target_ret_min"]).dropna(subset=FEATURE_COLS + ["target"]).copy()
+    n_rows = len(feat_df)
+    if n_rows < 90:
+        raise ValueError(f"{symbol} 有效回測樣本不足。")
+
+    start_idx = max(60, int(n_rows * 0.55))
+    step_stride = 2 if (is_intraday_scalp and (n_rows - start_idx) > 260) else 1
+
+    trades = []
+    signals_evaluated = 0
+    for idx in range(start_idx, n_rows - horizon_steps, step_stride):
+        train_slice = feat_df.iloc[:idx]
+        if len(train_slice) < 50:
+            continue
+        signals_evaluated += 1
+        clf = RandomForestClassifier(
+            n_estimators=100,
+            max_depth=5,
+            min_samples_leaf=6,
+            random_state=42,
+            n_jobs=1,
+        )
+        clf.fit(train_slice[FEATURE_COLS], train_slice["target"])
+        row = feat_df.iloc[idx]
+        prob_up = float(clf.predict_proba(row[FEATURE_COLS].to_frame().T)[0][1])
+        blended_prob = float(np.clip(prob_up, 0.08, 0.92))
+
+        last_price = float(row["Close"])
+        prev_price = float(feat_df.iloc[idx - 1]["Close"])
+        atr_val = float(row["atr14"]) if pd.notna(row["atr14"]) and row["atr14"] > 0 else last_price * 0.01
+        rsi_now = float(row["rsi14"]) if pd.notna(row["rsi14"]) else 50.0
+
+        win_slice = feat_df.iloc[max(0, idx - 19): idx + 1]
+        high_20 = float(win_slice["High"].max())
+        low_20 = float(win_slice["Low"].min())
+        range_pos_pct = float(np.clip((last_price - low_20) / max(high_20 - low_20, 1e-8) * 100.0, 0.0, 100.0))
+
+        direction, _, entry_price, stop_loss, take_profit, _, _ = _decide_signal(
+            profile=profile,
+            prob_up=prob_up,
+            blended_prob=blended_prob,
+            test_acc=0.55,
+            news_score=0.0,
+            last_price=last_price,
+            prev_price=prev_price,
+            atr_val=atr_val,
+            rsi_now=rsi_now,
+            range_pos_pct=range_pos_pct,
+            low_20=low_20,
+            lev_val=lev_val,
+            is_intraday_scalp=is_intraday_scalp,
+        )
+
+        if direction not in ("偏多看漲", "偏空看跌"):
+            continue
+
+        future_bars = feat_df.iloc[idx + 1: idx + 1 + horizon_steps]
+        if future_bars.empty:
+            continue
+
+        is_long = (direction == "偏多看漲")
+        exit_price = float(future_bars["Close"].iloc[-1])
+
+        for _, fbar in future_bars.iterrows():
+            f_high = float(fbar["High"])
+            f_low = float(fbar["Low"])
+            if is_long:
+                if f_low <= stop_loss:
+                    exit_price = stop_loss
+                    break
+                if f_high >= take_profit:
+                    exit_price = take_profit
+                    break
+            else:
+                if f_high >= stop_loss:
+                    exit_price = stop_loss
+                    break
+                if f_low <= take_profit:
+                    exit_price = take_profit
+                    break
+
+        raw_ret = ((exit_price - entry_price) / max(entry_price, 1e-8)) if is_long else ((entry_price - exit_price) / max(entry_price, 1e-8))
+        net_ret = (raw_ret - fee_cost) * lev_val
+        trades.append(net_ret)
+
+    if not trades:
+        return {
+            "symbol": symbol,
+            "market": market,
+            "target_days": f"{target_days:g}",
+            "leverage": round(lev_val, 2),
+            "timeframe": "1h K線（模擬極短線）" if is_intraday_scalp else "1d 日線",
+            "bars_tested": signals_evaluated,
+            "trade_count": 0,
+            "win_rate_pct": 0.0,
+            "avg_return_pct": 0.0,
+            "profit_factor": 0.0,
+            "max_drawdown_pct": 0.0,
+            "note": "回測期間內符合進場條件的訊號較少，建議換標的或調整天數再測。",
+        }
+
+    arr = np.array(trades, dtype=float)
+    wins = arr[arr > 0]
+    losses = arr[arr <= 0]
+    win_rate = round(float(len(wins) / len(arr) * 100.0), 1)
+    avg_ret = round(float(np.mean(arr) * 100.0), 2)
+
+    gross_win = float(np.sum(wins)) if len(wins) else 0.0
+    gross_loss = abs(float(np.sum(losses))) if len(losses) else 0.0
+    profit_factor = round(gross_win / gross_loss, 2) if gross_loss > 0 else (99.0 if gross_win > 0 else 0.0)
+
+    equity = np.cumprod(1.0 + np.clip(arr, -0.95, 5.0))
+    peak = np.maximum.accumulate(equity)
+    dd = (peak - equity) / np.maximum(peak, 1e-8)
+    max_dd_pct = round(float(np.max(dd) * 100.0), 2)
+
+    return {
+        "symbol": symbol,
+        "market": market,
+        "target_days": f"{target_days:g}",
+        "leverage": round(lev_val, 2),
+        "timeframe": "1h K線（模擬極短線）" if is_intraday_scalp else "1d 日線",
+        "bars_tested": signals_evaluated,
+        "trade_count": int(len(arr)),
+        "win_rate_pct": win_rate,
+        "avg_return_pct": avg_ret,
+        "profit_factor": profit_factor,
+        "max_drawdown_pct": max_dd_pct,
+        "note": f"已含雙邊手續費估算（{fee_cost * 100:.2f}%）與 {lev_val:g}x 槓桿放大。",
     }
 
 
@@ -670,6 +860,27 @@ def api_recommend():
             "criteria": "方向機率 ≥66%（或 ≤34% 且不追低空）＋ 驗證準確 ≥56% ＋ 盈虧比 ≥1.5 ＋ 新聞不打架",
             "recommendations": recs,
         })
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 400
+
+
+@app.route("/api/backtest", methods=["POST"])
+def api_backtest():
+    try:
+        body = request.get_json(force=True, silent=True) or {}
+        market = body.get("market", "加密貨幣")
+        symbol = body.get("symbol", "BTC-USD")
+        days = float(body.get("days", 3))
+        lev_raw = str(body.get("leverage", "")).strip()
+        lev_val = float(lev_raw) if lev_raw else None
+
+        res = run_backtest(
+            market=market,
+            raw_symbol=symbol,
+            target_days=days,
+            leverage=lev_val,
+        )
+        return jsonify(res)
     except Exception as exc:
         return jsonify({"error": str(exc)}), 400
 
