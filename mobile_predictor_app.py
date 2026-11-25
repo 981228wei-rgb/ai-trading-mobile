@@ -635,13 +635,16 @@ def run_backtest(market: str, raw_symbol: str, target_days=3, leverage=None):
     profile = get_track_profile(market, target_days)
     symbol = normalize_symbol(market, raw_symbol)
     is_intraday_scalp = (market == "加密貨幣" and target_days < 1.0)
-    horizon_steps = max(2, int(round(target_days * 24))) if is_intraday_scalp else max(1, int(round(target_days)))
     lev_val = float(leverage) if (leverage is not None and leverage > 0) else 1.0
     fee_cost = profile["fee_rate"] * 2.0
     backtest_days = 30
 
     df = fetch_history_df(symbol, is_intraday_scalp)
-    if df is None or df.empty or len(df) < 90:
+    if (df is None or df.empty or len(df) < 60) and is_intraday_scalp:
+        df = fetch_history_df(symbol, False)
+        is_intraday_scalp = False
+
+    if df is None or df.empty or len(df) < 45:
         raise ValueError(f"{symbol} 歷史 K 線不足，無法執行 30 天回測。")
 
     if isinstance(df.columns, pd.MultiIndex):
@@ -650,9 +653,15 @@ def run_backtest(market: str, raw_symbol: str, target_days=3, leverage=None):
         df["Volume"] = 0.0
 
     df = df[["Open", "High", "Low", "Close", "Volume"]].dropna(subset=["Open", "High", "Low", "Close"]).copy()
+    if len(df) < 45:
+        raise ValueError(f"{symbol} 有效 K 線資料不足。")
+
+    horizon_steps = max(2, int(round(target_days * 24))) if is_intraday_scalp else max(1, int(round(target_days)))
+    horizon_steps = min(horizon_steps, max(1, len(df) // 6))
+
     feat_df = _build_feature_df(df, horizon_steps, profile["target_ret_min"]).dropna(subset=FEATURE_COLS + ["target"]).copy()
     n_rows = len(feat_df)
-    if n_rows < 75:
+    if n_rows < 35:
         raise ValueError(f"{symbol} 有效回測樣本不足。")
 
     idx_dt = pd.to_datetime(feat_df.index)
@@ -665,10 +674,15 @@ def run_backtest(market: str, raw_symbol: str, target_days=3, leverage=None):
     cutoff_ts = end_ts - pd.Timedelta(days=backtest_days)
     window_candidates = np.where(feat_df.index >= cutoff_ts)[0]
     if len(window_candidates) == 0:
-        window_candidates = np.arange(max(50, n_rows - 30), n_rows)
+        window_candidates = np.arange(max(25, n_rows - 20), n_rows)
 
-    start_idx = max(50, int(window_candidates[0]))
+    min_train_rows = min(25, max(15, n_rows // 3))
+    start_idx = max(min_train_rows, int(window_candidates[0]))
     stop_idx = max(start_idx + 1, n_rows - horizon_steps)
+    if start_idx >= stop_idx:
+        start_idx = max(min_train_rows, n_rows - horizon_steps - 5)
+        stop_idx = max(start_idx + 1, n_rows - horizon_steps)
+
     if start_idx >= stop_idx:
         raise ValueError(f"{symbol} 最近 30 天可結算的 K 線不足。")
 
@@ -683,80 +697,86 @@ def run_backtest(market: str, raw_symbol: str, target_days=3, leverage=None):
     trades = []
     signals_evaluated = 0
     for idx in range(start_idx, stop_idx, step_stride):
-        train_slice = feat_df.iloc[:idx]
-        if len(train_slice) < 50:
+        try:
+            train_slice = feat_df.iloc[:idx]
+            if len(train_slice) < min_train_rows:
+                continue
+            signals_evaluated += 1
+            clf = RandomForestClassifier(
+                n_estimators=70,
+                max_depth=5,
+                min_samples_leaf=4,
+                random_state=42,
+                n_jobs=1,
+            )
+            clf.fit(train_slice[FEATURE_COLS], train_slice["target"])
+            sample_x = feat_df[FEATURE_COLS].iloc[[idx]].ffill().bfill()
+            if sample_x.isna().any().any():
+                continue
+            prob_up = float(clf.predict_proba(sample_x)[0][1])
+            blended_prob = float(np.clip(prob_up, 0.08, 0.92))
+
+            row = feat_df.iloc[idx]
+            last_price = float(row["Close"])
+            prev_price = float(feat_df.iloc[idx - 1]["Close"]) if idx >= 1 else last_price
+            atr_val = float(row["atr14"]) if pd.notna(row["atr14"]) and row["atr14"] > 0 else last_price * 0.01
+            rsi_now = float(row["rsi14"]) if pd.notna(row["rsi14"]) else 50.0
+
+            win_slice = feat_df.iloc[max(0, idx - 19): idx + 1]
+            high_20 = float(win_slice["High"].max())
+            low_20 = float(win_slice["Low"].min())
+            range_pos_pct = float(np.clip((last_price - low_20) / max(high_20 - low_20, 1e-8) * 100.0, 0.0, 100.0))
+
+            direction, _, entry_price, stop_loss, take_profit, _, _ = _decide_signal(
+                profile=profile,
+                prob_up=prob_up,
+                blended_prob=blended_prob,
+                test_acc=0.55,
+                news_score=0.0,
+                last_price=last_price,
+                prev_price=prev_price,
+                atr_val=atr_val,
+                rsi_now=rsi_now,
+                range_pos_pct=range_pos_pct,
+                low_20=low_20,
+                lev_val=lev_val,
+                is_intraday_scalp=is_intraday_scalp,
+            )
+
+            if direction not in ("偏多看漲", "偏空看跌"):
+                continue
+
+            future_bars = feat_df.iloc[idx + 1: idx + 1 + horizon_steps]
+            if future_bars.empty:
+                continue
+
+            is_long = (direction == "偏多看漲")
+            exit_price = float(future_bars["Close"].iloc[-1])
+
+            for _, fbar in future_bars.iterrows():
+                f_high = float(fbar["High"])
+                f_low = float(fbar["Low"])
+                if is_long:
+                    if f_low <= stop_loss:
+                        exit_price = stop_loss
+                        break
+                    if f_high >= take_profit:
+                        exit_price = take_profit
+                        break
+                else:
+                    if f_high >= stop_loss:
+                        exit_price = stop_loss
+                        break
+                    if f_low <= take_profit:
+                        exit_price = take_profit
+                        break
+
+            raw_ret = ((exit_price - entry_price) / max(entry_price, 1e-8)) if is_long else ((entry_price - exit_price) / max(entry_price, 1e-8))
+            net_ret = (raw_ret - fee_cost) * lev_val
+            if np.isfinite(net_ret):
+                trades.append(float(net_ret))
+        except Exception:
             continue
-        signals_evaluated += 1
-        clf = RandomForestClassifier(
-            n_estimators=70,
-            max_depth=5,
-            min_samples_leaf=6,
-            random_state=42,
-            n_jobs=1,
-        )
-        clf.fit(train_slice[FEATURE_COLS], train_slice["target"])
-        sample_x = feat_df[FEATURE_COLS].iloc[[idx]]
-        prob_up = float(clf.predict_proba(sample_x)[0][1])
-        blended_prob = float(np.clip(prob_up, 0.08, 0.92))
-
-        row = feat_df.iloc[idx]
-        last_price = float(row["Close"])
-        prev_price = float(feat_df.iloc[idx - 1]["Close"])
-        atr_val = float(row["atr14"]) if pd.notna(row["atr14"]) and row["atr14"] > 0 else last_price * 0.01
-        rsi_now = float(row["rsi14"]) if pd.notna(row["rsi14"]) else 50.0
-
-        win_slice = feat_df.iloc[max(0, idx - 19): idx + 1]
-        high_20 = float(win_slice["High"].max())
-        low_20 = float(win_slice["Low"].min())
-        range_pos_pct = float(np.clip((last_price - low_20) / max(high_20 - low_20, 1e-8) * 100.0, 0.0, 100.0))
-
-        direction, _, entry_price, stop_loss, take_profit, _, _ = _decide_signal(
-            profile=profile,
-            prob_up=prob_up,
-            blended_prob=blended_prob,
-            test_acc=0.55,
-            news_score=0.0,
-            last_price=last_price,
-            prev_price=prev_price,
-            atr_val=atr_val,
-            rsi_now=rsi_now,
-            range_pos_pct=range_pos_pct,
-            low_20=low_20,
-            lev_val=lev_val,
-            is_intraday_scalp=is_intraday_scalp,
-        )
-
-        if direction not in ("偏多看漲", "偏空看跌"):
-            continue
-
-        future_bars = feat_df.iloc[idx + 1: idx + 1 + horizon_steps]
-        if future_bars.empty:
-            continue
-
-        is_long = (direction == "偏多看漲")
-        exit_price = float(future_bars["Close"].iloc[-1])
-
-        for _, fbar in future_bars.iterrows():
-            f_high = float(fbar["High"])
-            f_low = float(fbar["Low"])
-            if is_long:
-                if f_low <= stop_loss:
-                    exit_price = stop_loss
-                    break
-                if f_high >= take_profit:
-                    exit_price = take_profit
-                    break
-            else:
-                if f_high >= stop_loss:
-                    exit_price = stop_loss
-                    break
-                if f_low <= take_profit:
-                    exit_price = take_profit
-                    break
-
-        raw_ret = ((exit_price - entry_price) / max(entry_price, 1e-8)) if is_long else ((entry_price - exit_price) / max(entry_price, 1e-8))
-        net_ret = (raw_ret - fee_cost) * lev_val
-        trades.append(net_ret)
 
     stride_note = f"（1h 每 {step_stride} 根抽樣）" if is_intraday_scalp else ""
 
