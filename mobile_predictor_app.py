@@ -13,6 +13,7 @@ import yfinance as yf
 from flask import Flask, jsonify, render_template, request
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import accuracy_score
+from sklearn.model_selection import TimeSeriesSplit
 
 app = Flask(__name__)
 
@@ -68,11 +69,42 @@ MARKET_PRESETS = {
     ],
 }
 
+TRACK_PROFILES = {
+    "加密貨幣": {
+        "track_name": "加密貨幣軌（寬停損・防插針）",
+        "bull_threshold": 0.58,
+        "bear_threshold": 0.42,
+        "entry_atr_mult": 0.50,
+        "stop_atr_mult": 2.00,
+        "tp_atr_mult": 2.80,
+        "target_ret_min": 0.008,
+        "max_risk_pct": 0.015,
+        "min_stop_pct": 0.015,
+    },
+    "股票": {
+        "track_name": "股票軌（順均線・控波段）",
+        "bull_threshold": 0.55,
+        "bear_threshold": 0.45,
+        "entry_atr_mult": 0.35,
+        "stop_atr_mult": 1.40,
+        "tp_atr_mult": 2.10,
+        "target_ret_min": 0.003,
+        "max_risk_pct": 0.020,
+        "min_stop_pct": 0.008,
+    },
+}
+
+
+def get_track_profile(market: str) -> dict:
+    if market == "加密貨幣":
+        return TRACK_PROFILES["加密貨幣"]
+    return TRACK_PROFILES["股票"]
+
 
 def normalize_symbol(market: str, raw_symbol: str) -> str:
     sym = (raw_symbol or "").strip().upper()
     if not sym:
-        return "BTC-USD"
+        return "BTC-USD" if market == "加密貨幣" else "NVDA"
     if market == "加密貨幣":
         if "-" not in sym and not sym.endswith("USD"):
             return f"{sym}-USD"
@@ -201,78 +233,106 @@ def fetch_live_price(symbol: str):
     return None
 
 
+def _evaluate_time_series_cv(X: pd.DataFrame, y: pd.Series) -> float:
+    n_samples = len(X)
+    if n_samples < 60:
+        return 0.5
+    n_splits = min(4, max(2, n_samples // 35))
+    tscv = TimeSeriesSplit(n_splits=n_splits)
+    scores = []
+    for train_idx, val_idx in tscv.split(X):
+        if len(train_idx) < 25 or len(val_idx) < 8:
+            continue
+        m = RandomForestClassifier(
+            n_estimators=160,
+            max_depth=5,
+            min_samples_leaf=6,
+            random_state=42,
+            n_jobs=1,
+        )
+        m.fit(X.iloc[train_idx], y.iloc[train_idx])
+        preds = m.predict(X.iloc[val_idx])
+        scores.append(float(accuracy_score(y.iloc[val_idx], preds)))
+    return float(np.mean(scores)) if scores else 0.5
+
+
 def run_prediction(market: str, raw_symbol: str, target_days: int = 3, leverage=None, capital=None):
+    profile = get_track_profile(market)
     symbol = normalize_symbol(market, raw_symbol)
     target_days = max(1, min(int(target_days or 3), 15))
 
     with ThreadPoolExecutor(max_workers=3) as pool:
-        hist_fut = pool.submit(yf.download, symbol, period="1y", interval="1d", progress=False, auto_adjust=True)
+        hist_fut = pool.submit(yf.download, symbol, period="2y", interval="1d", progress=False, auto_adjust=True)
         news_fut = pool.submit(fetch_news_headlines, symbol, 8)
         live_fut = pool.submit(fetch_live_price, symbol)
         df = hist_fut.result()
         headlines = news_fut.result()
         live_price = live_fut.result()
 
-    if df is None or df.empty or len(df) < 40:
+    if df is None or df.empty or len(df) < 60:
         raise ValueError(f"找不到 {symbol} 足夠的歷史行情資料，請確認代碼是否正確（例如 BTC-USD、NVDA、2330.TW）。")
 
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
 
     df = df[["Open", "High", "Low", "Close", "Volume"]].dropna().copy()
-    if len(df) < 40:
+    if len(df) < 60:
         raise ValueError(f"{symbol} 有效交易日資料不足。")
 
     close = df["Close"]
+    vol = df["Volume"].replace(0, np.nan)
+    vol_ma20 = vol.rolling(20).mean()
+
     df["ret_1d"] = close.pct_change()
     df["ret_3d"] = close.pct_change(3)
     df["ret_5d"] = close.pct_change(5)
     df["ma10"] = close.rolling(10).mean()
     df["ma20"] = close.rolling(20).mean()
     df["ma60"] = close.rolling(60).mean()
-    df["ma10_gap"] = (close - df["ma10"]) / df["ma10"]
-    df["ma20_gap"] = (close - df["ma20"]) / df["ma20"]
+    df["ma10_gap"] = (close - df["ma10"]) / df["ma10"].replace(0, np.nan)
+    df["ma20_gap"] = (close - df["ma20"]) / df["ma20"].replace(0, np.nan)
+    df["ma20_slope"] = df["ma20"].pct_change(3)
     df["rsi14"] = compute_rsi(close, 14)
     macd, signal, hist = compute_macd(close)
     df["macd_hist"] = hist / close.replace(0, np.nan)
     df["vol_20"] = df["ret_1d"].rolling(20).std()
+    df["vol_ratio"] = (vol / vol_ma20).clip(0.1, 5.0).fillna(1.0)
     df["atr14"] = compute_atr(df, 14)
     df["atr_pct"] = df["atr14"] / close.replace(0, np.nan)
 
     df["future_ret"] = close.shift(-target_days) / close - 1.0
-    df["target"] = (df["future_ret"] > 0).astype(int)
+    df["target"] = (df["future_ret"] > profile["target_ret_min"]).astype(int)
 
     features = [
         "ret_1d", "ret_3d", "ret_5d",
-        "ma10_gap", "ma20_gap", "rsi14",
-        "macd_hist", "vol_20", "atr_pct"
+        "ma10_gap", "ma20_gap", "ma20_slope",
+        "rsi14", "macd_hist", "vol_20", "vol_ratio", "atr_pct"
     ]
 
     model_df = df.dropna(subset=features + ["target"]).copy()
-    if len(model_df) < 35:
+    if len(model_df) < 50:
         raise ValueError("可訓練樣本數不足，請嘗試其他標的。")
 
-    split_idx = int(len(model_df) * 0.8)
-    X_train, y_train = model_df[features].iloc[:split_idx], model_df["target"].iloc[:split_idx]
-    X_test, y_test = model_df[features].iloc[split_idx:], model_df["target"].iloc[split_idx:]
+    X_all = model_df[features]
+    y_all = model_df["target"]
+
+    test_acc = _evaluate_time_series_cv(X_all, y_all)
 
     clf = RandomForestClassifier(
         n_estimators=180,
-        max_depth=6,
-        min_samples_leaf=4,
+        max_depth=5,
+        min_samples_leaf=6,
         random_state=42,
-        n_jobs=-1,
+        n_jobs=1,
     )
-    clf.fit(X_train, y_train)
-
-    test_acc = float(accuracy_score(y_test, clf.predict(X_test))) if len(X_test) > 0 else 0.5
+    clf.fit(X_all, y_all)
 
     latest_row = df[features].iloc[[-1]].ffill().bfill()
     prob_up = float(clf.predict_proba(latest_row)[0][1])
 
     news_info = score_news(headlines)
-    news_adj = news_info["score"] * 0.12
-    blended_prob = float(np.clip(prob_up + news_adj, 0.05, 0.95))
+    news_adj = news_info["score"] * 0.08 if abs(news_info["score"]) >= 0.15 else 0.0
+    blended_prob = float(np.clip(prob_up + news_adj, 0.08, 0.92))
 
     last_price = live_price if live_price is not None else float(close.iloc[-1])
     prev_price = float(close.iloc[-2]) if len(close) >= 2 else last_price
@@ -282,32 +342,41 @@ def run_prediction(market: str, raw_symbol: str, target_days: int = 3, leverage=
     vol_val = float(df["vol_20"].iloc[-1]) if pd.notna(df["vol_20"].iloc[-1]) else 0.02
     expected_move_pct = float(vol_val * np.sqrt(target_days) * 100.0)
 
-    if blended_prob >= 0.58:
+    entry_mult = profile["entry_atr_mult"]
+    stop_mult = profile["stop_atr_mult"]
+    tp_mult = profile["tp_atr_mult"]
+
+    if blended_prob >= profile["bull_threshold"]:
         direction = "偏多看漲"
-        action = "偏多操作（嚴守停損）"
-        entry_price = round(last_price - 0.5 * atr_val, 4)
-    elif blended_prob <= 0.42:
+        action = f"回測支撐偏多（停損 {stop_mult:.1f} ATR）"
+        entry_price = round(min(last_price, last_price - entry_mult * atr_val), 4)
+        stop_loss = round(entry_price - stop_mult * atr_val, 4)
+        take_profit = round(entry_price + tp_mult * atr_val, 4)
+    elif blended_prob <= profile["bear_threshold"]:
         direction = "偏空看跌"
-        action = "偏空/觀望（控制風險）"
-        entry_price = round(last_price + 0.5 * atr_val, 4)
+        action = f"反彈壓力偏空（停損 {stop_mult:.1f} ATR）"
+        entry_price = round(max(last_price, last_price + entry_mult * atr_val), 4)
+        stop_loss = round(entry_price + stop_mult * atr_val, 4)
+        take_profit = round(entry_price - tp_mult * atr_val, 4)
     else:
         direction = "震盪中性"
-        action = "觀望或區間試單"
+        action = "觀望為主，區間高低點輕倉試單"
         entry_price = round(last_price, 4)
-
-    stop_loss = round(last_price - 1.5 * atr_val, 4)
-    take_profit = round(last_price + 2.2 * atr_val, 4)
+        stop_loss = round(last_price - stop_mult * atr_val, 4)
+        take_profit = round(last_price + stop_mult * atr_val, 4)
 
     risk_box = None
     if capital is not None and capital > 0:
         lev = float(leverage) if (leverage is not None and leverage > 0) else 1.0
-        max_risk_amt = capital * 0.02
-        stop_dist_pct = max(abs(entry_price - stop_loss) / max(entry_price, 1e-8), 0.005)
+        max_risk_amt = capital * profile["max_risk_pct"]
+        stop_dist = abs(entry_price - stop_loss)
+        stop_dist_pct = max(stop_dist / max(entry_price, 1e-8), profile["min_stop_pct"])
         suggested_notional = min(capital * lev, max_risk_amt / stop_dist_pct)
         suggested_units = suggested_notional / entry_price if entry_price > 0 else 0.0
         risk_box = {
             "capital": round(capital, 2),
             "leverage": round(lev, 2),
+            "risk_pct_label": f"{profile['max_risk_pct'] * 100:.1f}%",
             "max_risk_2pct": round(max_risk_amt, 2),
             "suggested_notional": round(suggested_notional, 2),
             "suggested_units": round(suggested_units, 4),
@@ -321,6 +390,7 @@ def run_prediction(market: str, raw_symbol: str, target_days: int = 3, leverage=
     return {
         "symbol": symbol,
         "market": market,
+        "track_name": profile["track_name"],
         "target_days": target_days,
         "updated_at": taipei_now,
         "last_price": round(last_price, 4),
