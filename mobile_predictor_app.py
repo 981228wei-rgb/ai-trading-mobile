@@ -424,6 +424,7 @@ def _decide_signal(
     stop_mult = profile["stop_atr_mult"]
     tp_mult = profile["tp_atr_mult"]
 
+    is_bottom_zone = (range_pos_pct <= 12.0) or (rsi_now <= 26.0)
     low_zone_no_short = (
         range_pos_pct <= 20.0
         or rsi_now <= 35.0
@@ -432,37 +433,49 @@ def _decide_signal(
 
     if extreme_high_risk or indecisive_conflict:
         direction = "建議先不做單"
-        entry_price = round(last_price - max(entry_mult, 0.35) * atr_val, 4)
+        entry_price = round(last_price, 4)
         stop_loss = round(entry_price - stop_mult * atr_val, 4)
         take_profit = round(entry_price + tp_mult * atr_val, 4)
         rr_ratio = round(tp_mult / max(stop_mult, 1e-8), 2)
         action = "極短線波動與槓桿風險過高，建議先空手觀望，不硬做單" if extreme_high_risk else "訊號處於五五波與多空拉鋸，建議先不做單"
     elif blended_prob >= profile["bull_threshold"]:
         direction = "偏多看漲"
-        pullback_buf = max(entry_mult, 0.25) * atr_val
-        entry_price = round(last_price - pullback_buf, 4)
+        if is_bottom_zone or range_pos_pct <= 25.0 or rsi_now < 45.0:
+            entry_price = round(last_price, 4)
+            entry_hint = f"接近低檔/回升區，可評估現價 {entry_price} 附近進場"
+        else:
+            entry_price = round(last_price - entry_mult * atr_val, 4)
+            entry_hint = f"現價已偏高，建議等回測 {entry_price} 附近偏多"
         stop_loss = round(entry_price - stop_mult * atr_val, 4)
         take_profit = round(entry_price + tp_mult * atr_val, 4)
         risk_per_unit = max(entry_price - stop_loss, 1e-8)
         reward_per_unit = max(take_profit - entry_price, 0.0)
         rr_ratio = round(reward_per_unit / risk_per_unit, 2)
-        action = f"等回測 {entry_price} 附近偏多掛單（停損 {stop_mult:.2f} ATR / 停利 {tp_mult:.2f} ATR，盈虧比 1:{rr_ratio}）"
+        action = f"{entry_hint}（停損 {stop_mult:.2f} ATR / 停利 {tp_mult:.2f} ATR，盈虧比 1:{rr_ratio}）"
     elif blended_prob <= profile["bear_threshold"] and not low_zone_no_short:
         direction = "偏空看跌"
-        rebound_buf = max(entry_mult, 0.25) * atr_val
-        entry_price = round(last_price + rebound_buf, 4)
+        if range_pos_pct >= 80.0 or rsi_now >= 68.0:
+            entry_price = round(last_price, 4)
+            entry_hint = f"處於高檔轉弱區，可評估現價 {entry_price} 附近偏空"
+        else:
+            entry_price = round(last_price + entry_mult * atr_val, 4)
+            entry_hint = f"建議等反彈至 {entry_price} 附近偏空"
         stop_loss = round(entry_price + stop_mult * atr_val, 4)
         take_profit = round(entry_price - tp_mult * atr_val, 4)
         risk_per_unit = max(stop_loss - entry_price, 1e-8)
         reward_per_unit = max(entry_price - take_profit, 0.0)
         rr_ratio = round(reward_per_unit / risk_per_unit, 2)
-        action = f"等反彈至 {entry_price} 附近偏空掛單（停損 {stop_mult:.2f} ATR / 停利 {tp_mult:.2f} ATR，盈虧比 1:{rr_ratio}）"
+        action = f"{entry_hint}（停損 {stop_mult:.2f} ATR / 停利 {tp_mult:.2f} ATR，盈虧比 1:{rr_ratio}）"
     elif blended_prob <= profile["bear_threshold"] and low_zone_no_short:
         direction = "低點防反彈（不追空）"
-        support_pullback = max(entry_mult * 1.35, 0.45) * atr_val
-        entry_price = round(min(last_price - support_pullback, max(low_20, last_price - support_pullback)), 4)
-        if entry_price >= last_price:
-            entry_price = round(last_price - support_pullback, 4)
+        if is_bottom_zone:
+            entry_price = round(last_price, 4)
+            entry_hint = f"已貼近低位/超賣區，若要接反彈可看現價 {entry_price} 附近"
+        else:
+            entry_price = round(max(low_20, last_price - max(entry_mult, 0.35) * atr_val), 4)
+            if entry_price >= last_price:
+                entry_price = round(last_price - max(entry_mult, 0.35) * atr_val, 4)
+            entry_hint = f"不追空，若要接反彈可等 {entry_price} 支撐區"
         min_buf = max(stop_mult * atr_val, entry_price * profile["min_stop_pct"])
         raw_stop = min(entry_price - min_buf, low_20 - 0.25 * atr_val)
         stop_loss = round(max(raw_stop, entry_price - max(stop_mult * 1.25, 1.0) * atr_val), 4)
@@ -472,14 +485,14 @@ def _decide_signal(
         risk_per_unit = max(entry_price - stop_loss, 1e-8)
         reward_per_unit = max(take_profit - entry_price, 0.0)
         rr_ratio = round(reward_per_unit / risk_per_unit, 2)
-        action = f"處於低位/超賣或急拉區，不追空，等往下回測 {entry_price} 支撐區再觀察"
+        action = f"{entry_hint}，禁止低點追空"
     else:
         direction = "震盪中性"
-        entry_price = round(last_price - max(entry_mult, 0.35) * atr_val, 4)
+        entry_price = round(last_price, 4) if is_bottom_zone else round(last_price - entry_mult * atr_val, 4)
         stop_loss = round(entry_price - stop_mult * atr_val, 4)
         take_profit = round(entry_price + tp_mult * atr_val, 4)
         rr_ratio = round(tp_mult / max(stop_mult, 1e-8), 2)
-        action = f"區間觀望，等回測 {entry_price} 附近再評估（盈虧比參考 1:{rr_ratio}）"
+        action = f"震盪觀望，參考進場點 {entry_price}（盈虧比 1:{rr_ratio}）"
 
     return direction, action, entry_price, stop_loss, take_profit, rr_ratio, chg_pct
 
