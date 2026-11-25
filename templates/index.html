@@ -131,7 +131,7 @@
   <div class="container">
     <div class="header">
       <h1>📱 AI 行情與風控助手</h1>
-      <p>雙軌並行：股票順均線控波段・加密幣結構控損高盈虧比</p>
+      <p>雙軌並行：股票順均線控波段・加密幣極短線緊停損防洗盤</p>
     </div>
 
     <div class="card">
@@ -145,8 +145,8 @@
           </select>
         </div>
         <div>
-          <label for="days">預測天數（1～15）</label>
-          <input id="days" type="number" min="1" max="15" value="3" />
+          <label for="days">預測天數（0.05～15）</label>
+          <input id="days" type="number" min="0.05" max="15" step="0.05" value="0.1" />
         </div>
       </div>
 
@@ -164,7 +164,7 @@
         </div>
         <div>
           <label for="leverage">槓桿倍數（選填）</label>
-          <input id="leverage" type="number" step="any" placeholder="例如 1 或 2" />
+          <input id="leverage" type="number" step="any" placeholder="例如 1、5 或 10" />
         </div>
       </div>
 
@@ -172,7 +172,7 @@
     </div>
 
     <div id="resultArea"></div>
-    <div class="disclaimer">僅供量化分析與風控參考，不構成投資建議；交易請嚴控風險。</div>
+    <div class="disclaimer">僅供量化分析與風控參考，不構成投資建議；高槓桿極短線請嚴控風險。</div>
   </div>
 
   <script id="presets-data" type="application/json">{{ presets_json | safe }}</script>
@@ -217,7 +217,7 @@
         const payload = {
           market: document.getElementById("market").value,
           symbol: symVal,
-          days: Number(document.getElementById("days").value || 3),
+          days: Number(document.getElementById("days").value || 0.1),
           capital: document.getElementById("capital").value,
           leverage: document.getElementById("leverage").value,
         };
@@ -259,7 +259,7 @@
 
       let riskHtml = "";
       if (d.risk) {
-        const riskPctText = d.risk.risk_pct_label || "2.0%";
+        const riskPctText = d.risk.risk_pct_label || "1.0%";
         riskHtml = `
           <div class="card">
             <div style="font-weight:700;margin-bottom:8px;">🛡️ 資金風控試算（單筆最大風險 ${riskPctText}）</div>
@@ -314,7 +314,7 @@
           <div class="metric" style="margin-top:8px;">
             <div class="k">K 線與均線結構判讀</div>
             <div class="v" style="font-size:0.9rem;font-weight:600;">${st.summary || "—"}</div>
-            <div style="font-size:0.75rem;color:var(--muted);margin-top:4px;">20日高 / 低：${st.high_20 != null ? `${st.high_20} / ${st.low_20}` : "—"}</div>
+            <div style="font-size:0.75rem;color:var(--muted);margin-top:4px;">${st.range_label || "20根K線"}高 / 低：${st.high_20 != null ? `${st.high_20} / ${st.low_20}` : "—"}</div>
           </div>
         </div>
 
