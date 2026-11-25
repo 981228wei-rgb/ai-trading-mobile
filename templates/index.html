@@ -341,7 +341,7 @@
 
       setButtonsDisabled(true);
       btn.textContent = "回測中...";
-      area.innerHTML = `<div class="card">正在對 <b>${symVal}</b>（${daysVal}日）進行歷史逐筆停損停利回測，請稍候...</div>`;
+      area.innerHTML = `<div class="card">正在對 <b>${symVal}</b>（${daysVal}日）進行近 30 天歷史停損停利回測，請稍候...</div>`;
 
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), 90000);
@@ -385,10 +385,11 @@
     function renderBacktest(b) {
       const winClass = b.win_rate_pct >= 55 ? "tag-up" : (b.win_rate_pct >= 45 ? "tag-warn" : "tag-down");
       const avgClass = b.avg_return_pct >= 0 ? "tag-up" : "tag-down";
+      const btDays = b.backtest_days || 30;
       document.getElementById("resultArea").innerHTML = `
         <div class="card">
           <div class="track-row">
-            <span class="track-badge">📊 歷史回測：${b.symbol}（${b.target_days}日・${b.leverage}x）</span>
+            <span class="track-badge">📊 近${btDays}天回測：${b.symbol}（持倉${b.target_days}日・${b.leverage}x）</span>
             <span class="rr-badge">${b.timeframe}</span>
           </div>
           <div class="metrics">
