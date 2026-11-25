@@ -655,6 +655,12 @@ def run_backtest(market: str, raw_symbol: str, target_days=3, leverage=None):
     if n_rows < 75:
         raise ValueError(f"{symbol} 有效回測樣本不足。")
 
+    idx_dt = pd.to_datetime(feat_df.index)
+    if getattr(idx_dt, "tz", None) is not None:
+        idx_dt = idx_dt.tz_convert("UTC").tz_localize(None)
+    feat_df = feat_df.copy()
+    feat_df.index = idx_dt
+
     end_ts = feat_df.index[-1]
     cutoff_ts = end_ts - pd.Timedelta(days=backtest_days)
     window_candidates = np.where(feat_df.index >= cutoff_ts)[0]
@@ -689,10 +695,11 @@ def run_backtest(market: str, raw_symbol: str, target_days=3, leverage=None):
             n_jobs=1,
         )
         clf.fit(train_slice[FEATURE_COLS], train_slice["target"])
-        row = feat_df.iloc[idx]
-        prob_up = float(clf.predict_proba(row[FEATURE_COLS].to_frame().T)[0][1])
+        sample_x = feat_df[FEATURE_COLS].iloc[[idx]]
+        prob_up = float(clf.predict_proba(sample_x)[0][1])
         blended_prob = float(np.clip(prob_up, 0.08, 0.92))
 
+        row = feat_df.iloc[idx]
         last_price = float(row["Close"])
         prev_price = float(feat_df.iloc[idx - 1]["Close"])
         atr_val = float(row["atr14"]) if pd.notna(row["atr14"]) and row["atr14"] > 0 else last_price * 0.01
@@ -906,6 +913,11 @@ def api_backtest():
         return jsonify(res)
     except Exception as exc:
         return jsonify({"error": str(exc)}), 400
+
+
+@app.errorhandler(500)
+def handle_500(exc):
+    return jsonify({"error": f"伺服器內部錯誤：{exc}"}), 500
 
 
 if __name__ == "__main__":
