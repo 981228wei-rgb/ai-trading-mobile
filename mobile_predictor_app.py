@@ -271,6 +271,22 @@ def score_news(headlines):
     return {"score": round(avg_score, 3), "label": label, "items": items}
 
 
+def fetch_history_df(symbol: str) -> pd.DataFrame:
+    df = None
+    try:
+        df = yf.Ticker(symbol).history(period="2y", interval="1d", auto_adjust=True)
+    except Exception:
+        df = None
+
+    if df is None or df.empty:
+        try:
+            df = yf.download(symbol, period="2y", interval="1d", progress=False, auto_adjust=True, threads=False)
+        except Exception:
+            df = None
+
+    return df
+
+
 def fetch_live_price(symbol: str):
     try:
         info = yf.Ticker(symbol).fast_info
@@ -312,7 +328,7 @@ def run_prediction(market: str, raw_symbol: str, target_days: int = 3, leverage=
     target_days = max(1, min(int(target_days or 3), 15))
 
     with ThreadPoolExecutor(max_workers=3) as pool:
-        hist_fut = pool.submit(yf.download, symbol, period="2y", interval="1d", progress=False, auto_adjust=True)
+        hist_fut = pool.submit(fetch_history_df, symbol)
         news_fut = pool.submit(fetch_news_headlines, symbol, 8)
         live_fut = pool.submit(fetch_live_price, symbol)
         df = hist_fut.result()
@@ -325,7 +341,10 @@ def run_prediction(market: str, raw_symbol: str, target_days: int = 3, leverage=
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
 
-    df = df[["Open", "High", "Low", "Close", "Volume"]].dropna().copy()
+    if "Volume" not in df.columns:
+        df["Volume"] = 0.0
+
+    df = df[["Open", "High", "Low", "Close", "Volume"]].dropna(subset=["Open", "High", "Low", "Close"]).copy()
     if len(df) < 60:
         raise ValueError(f"{symbol} 有效交易日資料不足。")
 
@@ -488,7 +507,7 @@ def healthz():
 @app.route("/api/predict", methods=["POST"])
 def api_predict():
     try:
-        body = request.get_json(force=True) or {}
+        body = request.get_json(force=True, silent=True) or {}
         market = body.get("market", "加密貨幣")
         symbol = body.get("symbol", "BTC-USD")
         days = int(body.get("days", 3))
