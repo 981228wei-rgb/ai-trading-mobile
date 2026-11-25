@@ -344,7 +344,7 @@
       area.innerHTML = `<div class="card">正在對 <b>${symVal}</b>（${daysVal}日）進行近 30 天歷史停損停利回測，請稍候...</div>`;
 
       const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 90000);
+      const timer = setTimeout(() => controller.abort(), 120000);
 
       try {
         const payload = {
