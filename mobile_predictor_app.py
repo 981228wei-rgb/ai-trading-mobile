@@ -666,7 +666,11 @@ def run_backtest(market: str, raw_symbol: str, target_days=3, leverage=None):
     if start_idx >= stop_idx:
         raise ValueError(f"{symbol} 最近 30 天可結算的 K 線不足。")
 
-    step_stride = 2 if (is_intraday_scalp and (stop_idx - start_idx) > 260) else 1
+    if is_intraday_scalp:
+        step_stride = 6 if (stop_idx - start_idx) > 180 else 2
+    else:
+        step_stride = 1
+
     window_start_str = str(feat_df.index[start_idx])[:16]
     window_end_str = str(feat_df.index[min(stop_idx, n_rows - 1)])[:16]
 
@@ -678,7 +682,7 @@ def run_backtest(market: str, raw_symbol: str, target_days=3, leverage=None):
             continue
         signals_evaluated += 1
         clf = RandomForestClassifier(
-            n_estimators=100,
+            n_estimators=70,
             max_depth=5,
             min_samples_leaf=6,
             random_state=42,
@@ -747,6 +751,8 @@ def run_backtest(market: str, raw_symbol: str, target_days=3, leverage=None):
         net_ret = (raw_ret - fee_cost) * lev_val
         trades.append(net_ret)
 
+    stride_note = f"（1h 每 {step_stride} 根抽樣）" if is_intraday_scalp else ""
+
     if not trades:
         return {
             "symbol": symbol,
@@ -755,7 +761,7 @@ def run_backtest(market: str, raw_symbol: str, target_days=3, leverage=None):
             "backtest_days": backtest_days,
             "window_range": f"{window_start_str} ～ {window_end_str}",
             "leverage": round(lev_val, 2),
-            "timeframe": "1h K線（近30天極短線）" if is_intraday_scalp else "1d 日線（近30天）",
+            "timeframe": f"1h K線（近30天極短線{stride_note}）" if is_intraday_scalp else "1d 日線（近30天）",
             "bars_tested": signals_evaluated,
             "trade_count": 0,
             "win_rate_pct": 0.0,
@@ -787,14 +793,14 @@ def run_backtest(market: str, raw_symbol: str, target_days=3, leverage=None):
         "backtest_days": backtest_days,
         "window_range": f"{window_start_str} ～ {window_end_str}",
         "leverage": round(lev_val, 2),
-        "timeframe": "1h K線（近30天極短線）" if is_intraday_scalp else "1d 日線（近30天）",
+        "timeframe": f"1h K線（近30天極短線{stride_note}）" if is_intraday_scalp else "1d 日線（近30天）",
         "bars_tested": signals_evaluated,
         "trade_count": int(len(arr)),
         "win_rate_pct": win_rate,
         "avg_return_pct": avg_ret,
         "profit_factor": profit_factor,
         "max_drawdown_pct": max_dd_pct,
-        "note": f"回測區間：{window_start_str} ～ {window_end_str}（近{backtest_days}天，含雙邊手續費 {fee_cost * 100:.2f}% 與 {lev_val:g}x 槓桿）。",
+        "note": f"回測區間：{window_start_str} ～ {window_end_str}（近{backtest_days}天{stride_note}，含雙邊手續費 {fee_cost * 100:.2f}% 與 {lev_val:g}x 槓桿）。",
     }
 
 
