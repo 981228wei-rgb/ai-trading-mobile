@@ -23,7 +23,7 @@
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Noto Sans TC", sans-serif;
       background: var(--bg);
       color: var(--text);
-      padding: 14px;
+      padding: 14px 14px 84px;
     }
     .container { max-width: 680px; margin: 0 auto; }
     .header {
@@ -77,8 +77,14 @@
     }
     .btn:disabled { opacity: 0.6; cursor: not-allowed; }
     .status-banner {
-      display: flex; justify-content: space-between; align-items: center;
-      padding: 12px; border-radius: 12px; background: var(--card-2); margin-bottom: 10px;
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 12px;
+      padding: 12px;
+      border-radius: 12px;
+      background: var(--card-2);
+      margin-bottom: 10px;
     }
     .tag-up { color: var(--up); font-weight: 700; }
     .tag-down { color: var(--down); font-weight: 700; }
@@ -86,8 +92,8 @@
     .metrics { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; }
     .metric { background: var(--card-2); padding: 10px; border-radius: 10px; }
     .metric .k { font-size: 0.75rem; color: var(--muted); }
-    .metric .v { font-size: 1.05rem; font-weight: 700; margin-top: 2px; }
-    .news-item { padding: 8px 0; border-bottom: 1px solid var(--border); font-size: 0.85rem; }
+    .metric .v { font-size: 1.05rem; font-weight: 700; margin-top: 2px; word-break: break-word; }
+    .news-item { padding: 8px 0; border-bottom: 1px solid var(--border); font-size: 0.85rem; line-height: 1.45; }
     .news-item:last-child { border-bottom: none; }
     .err { color: #fca5a5; background: rgba(239,68,68,0.15); border: 1px solid rgba(239,68,68,0.35); padding: 10px; border-radius: 10px; }
     .disclaimer { font-size: 0.75rem; color: var(--muted); text-align: center; margin-top: 8px; }
@@ -228,26 +234,31 @@
       document.getElementById("resultArea").innerHTML = `
         <div class="card">
           <div class="status-banner">
-            <div>
+            <div style="min-width:0;flex:1;">
               <div style="font-size:1.1rem;font-weight:700;">${d.symbol} <span class="${chgClass}" style="font-size:0.9rem;">(${d.chg_1d_pct >= 0 ? "+" : ""}${d.chg_1d_pct}%)</span></div>
-              <div style="font-size:0.8rem;color:var(--muted);">最新價：${d.last_price}｜更新：${d.updated_at}</div>
+              <div style="font-size:0.8rem;color:var(--muted);margin-top:2px;">最新價：${d.last_price}</div>
+              <div style="font-size:0.78rem;color:var(--muted);">更新：${d.updated_at}</div>
             </div>
-            <div style="text-align:right;">
+            <div style="text-align:right;max-width:44%;">
               <div class="${dirClass}" style="font-size:1.05rem;">${d.direction}</div>
-              <div style="font-size:0.78rem;color:var(--muted);">${d.action}</div>
+              <div style="font-size:0.78rem;color:var(--muted);margin-top:2px;">${d.action}</div>
             </div>
           </div>
 
           <div class="metrics">
+            <div class="metric"><div class="k">建議入場點</div><div class="v">${d.entry_price}</div></div>
             <div class="metric"><div class="k">綜合看漲機率（${d.target_days}日）</div><div class="v">${d.blended_prob_up}%</div></div>
-            <div class="metric"><div class="k">模型原始機率 / 測試準確</div><div class="v">${d.ml_prob_up}% / ${d.test_accuracy}%</div></div>
             <div class="metric"><div class="k">建議停損 / 停利</div><div class="v">${d.stop_loss} / ${d.take_profit}</div></div>
-            <div class="metric"><div class="k">預估波動幅度</div><div class="v">±${d.expected_move_pct}%</div></div>
+            <div class="metric"><div class="k">模型原始機率 / 測試準確</div><div class="v">${d.ml_prob_up}% / ${d.test_accuracy}%</div></div>
           </div>
 
           <div class="metrics" style="margin-top:8px;">
+            <div class="metric"><div class="k">預估波動幅度</div><div class="v">±${d.expected_move_pct}%</div></div>
             <div class="metric"><div class="k">RSI(14)</div><div class="v">${d.indicators.rsi14}</div></div>
-            <div class="metric"><div class="k">MA20 / MA60</div><div class="v">${d.indicators.ma20} / ${d.indicators.ma60}</div></div>
+          </div>
+
+          <div class="metrics" style="margin-top:8px;">
+            <div class="metric" style="grid-column: span 2;"><div class="k">MA20 / MA60</div><div class="v">${d.indicators.ma20} / ${d.indicators.ma60}</div></div>
           </div>
         </div>
 
