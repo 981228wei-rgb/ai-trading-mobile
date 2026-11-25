@@ -285,12 +285,15 @@ def run_prediction(market: str, raw_symbol: str, target_days: int = 3, leverage=
     if blended_prob >= 0.58:
         direction = "偏多看漲"
         action = "偏多操作（嚴守停損）"
+        entry_price = round(last_price - 0.5 * atr_val, 4)
     elif blended_prob <= 0.42:
         direction = "偏空看跌"
         action = "偏空/觀望（控制風險）"
+        entry_price = round(last_price + 0.5 * atr_val, 4)
     else:
         direction = "震盪中性"
         action = "觀望或區間試單"
+        entry_price = round(last_price, 4)
 
     stop_loss = round(last_price - 1.5 * atr_val, 4)
     take_profit = round(last_price + 2.2 * atr_val, 4)
@@ -299,9 +302,9 @@ def run_prediction(market: str, raw_symbol: str, target_days: int = 3, leverage=
     if capital is not None and capital > 0:
         lev = float(leverage) if (leverage is not None and leverage > 0) else 1.0
         max_risk_amt = capital * 0.02
-        stop_dist_pct = max(abs(last_price - stop_loss) / last_price, 0.005)
+        stop_dist_pct = max(abs(entry_price - stop_loss) / max(entry_price, 1e-8), 0.005)
         suggested_notional = min(capital * lev, max_risk_amt / stop_dist_pct)
-        suggested_units = suggested_notional / last_price if last_price > 0 else 0.0
+        suggested_units = suggested_notional / entry_price if entry_price > 0 else 0.0
         risk_box = {
             "capital": round(capital, 2),
             "leverage": round(lev, 2),
@@ -324,6 +327,7 @@ def run_prediction(market: str, raw_symbol: str, target_days: int = 3, leverage=
         "chg_1d_pct": round(chg_1d_pct, 2),
         "direction": direction,
         "action": action,
+        "entry_price": entry_price,
         "ml_prob_up": round(prob_up * 100, 1),
         "blended_prob_up": round(blended_prob * 100, 1),
         "test_accuracy": round(test_acc * 100, 1),
