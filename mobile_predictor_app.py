@@ -141,6 +141,56 @@ def compute_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     return tr.rolling(period).mean()
 
 
+def analyze_price_structure(df: pd.DataFrame, last_price: float) -> dict:
+    recent = df.tail(20).copy()
+    last_bar = df.iloc[-1]
+
+    open_p = float(last_bar["Open"])
+    high_p = float(last_bar["High"])
+    low_p = float(last_bar["Low"])
+    close_p = float(last_price)
+
+    total_range = max(high_p - low_p, 1e-8)
+    body = abs(close_p - open_p)
+    upper_wick = max(high_p - max(open_p, close_p), 0.0)
+    lower_wick = max(min(open_p, close_p) - low_p, 0.0)
+
+    if lower_wick >= total_range * 0.45 and lower_wick > upper_wick * 1.5:
+        candle_signal = "長下影線（下檔有承接/防插針）"
+    elif upper_wick >= total_range * 0.45 and upper_wick > lower_wick * 1.5:
+        candle_signal = "長上影線（上方有賣壓/防追高）"
+    elif body >= total_range * 0.65:
+        candle_signal = "強勢長紅K（多方動能明確）" if close_p >= open_p else "強勢長黑K（空方賣壓宣洩）"
+    else:
+        candle_signal = "十字/小實體震盪K（多空拉鋸）"
+
+    ma20 = float(df["ma20"].iloc[-1]) if pd.notna(df["ma20"].iloc[-1]) else close_p
+    ma60 = float(df["ma60"].iloc[-1]) if pd.notna(df["ma60"].iloc[-1]) else close_p
+
+    if close_p > ma20 and ma20 > ma60:
+        ma_structure = "多頭排列（站穩 MA20 與 MA60 之上）"
+    elif close_p < ma20 and ma20 < ma60:
+        ma_structure = "空頭排列（位於 MA20 與 MA60 之下）"
+    elif close_p >= ma20:
+        ma_structure = "短線偏強（站上 MA20，留意 MA60 壓力）"
+    else:
+        ma_structure = "短線偏弱（跌破 MA20，留意下方支撐）"
+
+    high_20 = float(recent["High"].max())
+    low_20 = float(recent["Low"].min())
+    range_20 = max(high_20 - low_20, 1e-8)
+    pos_in_range = round(float(np.clip((close_p - low_20) / range_20 * 100.0, 0.0, 100.0)), 1)
+
+    return {
+        "candle_signal": candle_signal,
+        "ma_structure": ma_structure,
+        "high_20": round(high_20, 4),
+        "low_20": round(low_20, 4),
+        "range_pos_pct": pos_in_range,
+        "summary": f"{ma_structure}｜{candle_signal}｜20日區間位置 {pos_in_range}%",
+    }
+
+
 def _parse_rss(feed_url: str, source_tag: str, limit: int = 5):
     items = []
     try:
@@ -379,9 +429,10 @@ def run_prediction(market: str, raw_symbol: str, target_days: int = 3, leverage=
             "risk_pct_label": f"{profile['max_risk_pct'] * 100:.1f}%",
             "max_risk_2pct": round(max_risk_amt, 2),
             "suggested_notional": round(suggested_notional, 2),
-            "suggested_units": round(suggested_units, 4),
+            "suggested_units": round(suggested_units, 6),
         }
 
+    structure_info = analyze_price_structure(df, last_price)
     rsi_now = float(df["rsi14"].iloc[-1]) if pd.notna(df["rsi14"].iloc[-1]) else 50.0
     ma20_now = float(df["ma20"].iloc[-1]) if pd.notna(df["ma20"].iloc[-1]) else last_price
     ma60_now = float(df["ma60"].iloc[-1]) if pd.notna(df["ma60"].iloc[-1]) else last_price
@@ -410,6 +461,7 @@ def run_prediction(market: str, raw_symbol: str, target_days: int = 3, leverage=
             "ma60": round(ma60_now, 4),
             "atr14": round(atr_val, 4),
         },
+        "structure": structure_info,
         "news": news_info,
         "risk": risk_box,
     }
