@@ -87,8 +87,8 @@ TRACK_PROFILES = {
     },
     "加密貨幣_極短線": {
         "track_name": "加密貨幣極短線軌（高槓桿・緊停損防洗盤）",
-        "bull_threshold": 0.62,
-        "bear_threshold": 0.38,
+        "bull_threshold": 0.595,
+        "bear_threshold": 0.405,
         "entry_atr_mult": 0.20,
         "stop_atr_mult": 0.85,
         "tp_atr_mult": 1.65,
@@ -565,8 +565,8 @@ def run_prediction(market: str, raw_symbol: str, target_days=3, leverage=None, c
     )
 
     news_score_val = news_info["score"]
-    news_aligned_bull = (blended_prob >= 0.66) and (news_score_val >= -0.10) and (prob_up >= 0.62)
-    news_aligned_bear = (blended_prob <= 0.34) and (news_score_val <= 0.10) and (prob_up <= 0.38)
+    news_aligned_bull = (blended_prob >= 0.64) and (news_score_val >= -0.10) and (prob_up >= 0.60)
+    news_aligned_bear = (blended_prob <= 0.36) and (news_score_val <= 0.10) and (prob_up <= 0.40)
     high_win_qualified = (
         direction in ("偏多看漲", "偏空看跌")
         and test_acc >= 0.56
@@ -687,7 +687,7 @@ def run_backtest(market: str, raw_symbol: str, target_days=3, leverage=None):
         raise ValueError(f"{symbol} 最近 30 天可結算的 K 線不足。")
 
     if is_intraday_scalp:
-        step_stride = 8 if (stop_idx - start_idx) > 200 else 3
+        step_stride = 6 if (stop_idx - start_idx) > 200 else 2
     else:
         step_stride = 1
 
@@ -697,7 +697,7 @@ def run_backtest(market: str, raw_symbol: str, target_days=3, leverage=None):
     trades = []
     signals_evaluated = 0
     retrain_every = 8 if is_intraday_scalp else 5
-    max_eval_steps = 65
+    max_eval_steps = 80
     clf = None
     steps_since_fit = 0
 
@@ -920,7 +920,7 @@ def api_recommend():
             "market": market,
             "target_days": f"{max(0.05, min(days, 15.0)):g}",
             "checked_at": datetime.now(ZoneInfo("Asia/Taipei")).strftime("%Y-%m-%d %H:%M:%S"),
-            "criteria": "方向機率 ≥66%（或 ≤34% 且不追低空）＋ 驗證準確 ≥56% ＋ 盈虧比 ≥1.5 ＋ 新聞不打架",
+            "criteria": "方向機率 ≥64%（或 ≤36% 且不追低空）＋ 驗證準確 ≥56% ＋ 盈虧比 ≥1.5 ＋ 新聞不打架",
             "recommendations": recs,
         })
     except Exception as exc:
