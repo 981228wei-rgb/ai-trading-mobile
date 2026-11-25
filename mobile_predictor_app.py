@@ -687,7 +687,7 @@ def run_backtest(market: str, raw_symbol: str, target_days=3, leverage=None):
         raise ValueError(f"{symbol} 最近 30 天可結算的 K 線不足。")
 
     if is_intraday_scalp:
-        step_stride = 6 if (stop_idx - start_idx) > 180 else 2
+        step_stride = 8 if (stop_idx - start_idx) > 200 else 3
     else:
         step_stride = 1
 
@@ -696,20 +696,33 @@ def run_backtest(market: str, raw_symbol: str, target_days=3, leverage=None):
 
     trades = []
     signals_evaluated = 0
+    retrain_every = 8 if is_intraday_scalp else 5
+    max_eval_steps = 65
+    clf = None
+    steps_since_fit = 0
+
     for idx in range(start_idx, stop_idx, step_stride):
+        if signals_evaluated >= max_eval_steps:
+            break
         try:
             train_slice = feat_df.iloc[:idx]
             if len(train_slice) < min_train_rows:
                 continue
+
+            if clf is None or steps_since_fit >= retrain_every:
+                clf = RandomForestClassifier(
+                    n_estimators=50,
+                    max_depth=5,
+                    min_samples_leaf=4,
+                    random_state=42,
+                    n_jobs=1,
+                )
+                clf.fit(train_slice[FEATURE_COLS], train_slice["target"])
+                steps_since_fit = 0
+
+            steps_since_fit += 1
             signals_evaluated += 1
-            clf = RandomForestClassifier(
-                n_estimators=70,
-                max_depth=5,
-                min_samples_leaf=4,
-                random_state=42,
-                n_jobs=1,
-            )
-            clf.fit(train_slice[FEATURE_COLS], train_slice["target"])
+
             sample_x = feat_df[FEATURE_COLS].iloc[[idx]].ffill().bfill()
             if sample_x.isna().any().any():
                 continue
@@ -778,7 +791,7 @@ def run_backtest(market: str, raw_symbol: str, target_days=3, leverage=None):
         except Exception:
             continue
 
-    stride_note = f"（1h 每 {step_stride} 根抽樣）" if is_intraday_scalp else ""
+    stride_note = f"（1h 每 {step_stride} 根抽樣・每 {retrain_every} 步重訓）" if is_intraday_scalp else ""
 
     if not trades:
         return {
