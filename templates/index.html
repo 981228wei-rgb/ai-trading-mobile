@@ -76,6 +76,14 @@
       cursor: pointer;
     }
     .btn:disabled { opacity: 0.6; cursor: not-allowed; }
+    .track-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin-bottom: 10px;
+    }
     .track-badge {
       display: inline-block;
       font-size: 0.78rem;
@@ -85,7 +93,16 @@
       border: 1px solid rgba(56, 189, 248, 0.3);
       padding: 4px 10px;
       border-radius: 999px;
-      margin-bottom: 10px;
+    }
+    .rr-badge {
+      display: inline-block;
+      font-size: 0.78rem;
+      font-weight: 700;
+      color: var(--up);
+      background: rgba(34, 197, 94, 0.12);
+      border: 1px solid rgba(34, 197, 94, 0.3);
+      padding: 4px 10px;
+      border-radius: 999px;
     }
     .status-banner {
       display: flex;
@@ -114,7 +131,7 @@
   <div class="container">
     <div class="header">
       <h1>📱 AI 行情與風控助手</h1>
-      <p>雙軌並行：股票順均線控波段・加密幣寬停損防插針</p>
+      <p>雙軌並行：股票順均線控波段・加密幣結構控損高盈虧比</p>
     </div>
 
     <div class="card">
@@ -213,17 +230,7 @@
         }
         renderResult(data);
       } catch (err) {
-        area.innerHTML = `<div class="card err">❌ ${err.message}</div>`;
-      } finally {
-        btn.disabled = false;
-        btn.textContent = "開始分析";
-      }
-    }
-
-    function renderResult(d) {
-      const dirClass = d.direction.includes("多") ? "tag-up" : (d.direction.includes("空") ? "tag-down" : "tag-warn");
-      const chgClass = d.chg_1d_pct >= 0 ? "tag-up" : "tag-down";
-      const trackLabel = d.track_name || d.market;
+        area.innerHTML = `<div class="card err">❌ ${err.message}</div>`; } finally { btn.disabled = false; btn.textContent = "開始分析"; } }  function renderResult(d) { const dirClass = d.direction.includes("多") ? "tag-up" : (d.direction.includes("空") ? "tag-down" : "tag-warn"); const chgClass = d.chg_1d_pct >= 0 ? "tag-up" : "tag-down"; const trackLabel = d.track_name \vert{}\vert{} d.market; const rrText = d.rr_ratio ? `盈虧比 1:${d.rr_ratio}` : "";
       const st = d.structure || {};
 
       let riskHtml = "";
@@ -243,12 +250,14 @@
 
       const newsHtml = (d.news.items || []).map(n => {
         const sClass = n.sentiment === "偏多" ? "tag-up" : (n.sentiment === "偏空" ? "tag-down" : "tag-warn");
-        return `<div class="news-item"><span class="${sClass}">[${n.sentiment}]</span> ${n.title}</div>`;
+        return `<div class="news-item"><span class="${sClass}">[${n.sentiment}]</span>${n.title}</div>`;
       }).join("") || `<div style="color:var(--muted);font-size:0.85rem;">目前無可用新聞標題</div>`;
 
       document.getElementById("resultArea").innerHTML = `
         <div class="card">
-          <div class="track-badge">🧭 ${trackLabel}</div>
+          <div class="track-row">
+            <span class="track-badge">🧭 ${trackLabel}</span>${rrText ? `<span class="rr-badge">⚖️ ${rrText}</span>` : ""}
+          </div>
           <div class="status-banner">
             <div style="min-width:0;flex:1;">
               <div style="font-size:1.1rem;font-weight:700;">${d.symbol} <span class="${chgClass}" style="font-size:0.9rem;">(${d.chg_1d_pct >= 0 ? "+" : ""}${d.chg_1d_pct}%)</span></div>
@@ -264,8 +273,8 @@
           <div class="metrics">
             <div class="metric"><div class="k">建議入場點</div><div class="v">${d.entry_price}</div></div>
             <div class="metric"><div class="k">綜合看漲機率（${d.target_days}日）</div><div class="v">${d.blended_prob_up}%</div></div>
-            <div class="metric"><div class="k">建議停損 / 停利</div><div class="v">${d.stop_loss} / ${d.take_profit}</div></div>
-            <div class="metric"><div class="k">模型原始機率 / 測試準確</div><div class="v">${d.ml_prob_up}% / ${d.test_accuracy}%</div></div>
+            <div class="metric"><div class="k">建議停損 / 停利</div><div class="v">${d.stop_loss} /${d.take_profit}</div></div>
+            <div class="metric"><div class="k">模型原始機率 / 測試準確</div><div class="v">${d.ml_prob_up}\% /${d.test_accuracy}%</div></div>
           </div>
 
           <div class="metrics" style="margin-top:8px;">
@@ -274,7 +283,7 @@
           </div>
 
           <div class="metrics" style="margin-top:8px;">
-            <div class="metric" style="grid-column: span 2;"><div class="k">MA20 / MA60</div><div class="v">${d.indicators.ma20} / ${d.indicators.ma60}</div></div>
+            <div class="metric" style="grid-column: span 2;"><div class="k">MA20 / MA60</div><div class="v">${d.indicators.ma20} /${d.indicators.ma60}</div></div>
           </div>
 
           <div class="metric" style="margin-top:8px;">
@@ -287,8 +296,7 @@
         ${riskHtml}
 
         <div class="card">
-          <div style="font-weight:700;margin-bottom:6px;">📰 新聞情緒：${d.news.label}</div>
-          ${newsHtml}
+          <div style="font-weight:700;margin-bottom:6px;">📰 新聞情緒：${d.news.label}</div>${newsHtml}
         </div>
       `;
     }
