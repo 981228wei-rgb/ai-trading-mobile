@@ -224,6 +224,7 @@
       const dirClass = d.direction.includes("多") ? "tag-up" : (d.direction.includes("空") ? "tag-down" : "tag-warn");
       const chgClass = d.chg_1d_pct >= 0 ? "tag-up" : "tag-down";
       const trackLabel = d.track_name || d.market;
+      const st = d.structure || {};
 
       let riskHtml = "";
       if (d.risk) {
@@ -274,6 +275,12 @@
 
           <div class="metrics" style="margin-top:8px;">
             <div class="metric" style="grid-column: span 2;"><div class="k">MA20 / MA60</div><div class="v">${d.indicators.ma20} / ${d.indicators.ma60}</div></div>
+          </div>
+
+          <div class="metric" style="margin-top:8px;">
+            <div class="k">K 線與均線結構判讀</div>
+            <div class="v" style="font-size:0.9rem;font-weight:600;">${st.summary || "—"}</div>
+            <div style="font-size:0.75rem;color:var(--muted);margin-top:4px;">20日高 / 低：${st.high_20 != null ? `${st.high_20} / ${st.low_20}` : "—"}</div>
           </div>
         </div>
 
