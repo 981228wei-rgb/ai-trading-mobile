@@ -336,8 +336,16 @@ def fetch_live_price(symbol: str):
 def _build_feature_df(df: pd.DataFrame, horizon_steps: int, target_ret_min: float) -> pd.DataFrame:
     out = df.copy()
     close = out["Close"]
+    high = out["High"]
+    low = out["Low"]
     vol = out["Volume"].replace(0, np.nan)
     vol_ma20 = vol.rolling(20).mean()
+
+    high_20 = high.rolling(20).max()
+    low_20 = low.rolling(20).min()
+    bar_range = (high - low).replace(0, np.nan)
+    upper_wick = high - np.maximum(out["Open"], close)
+    lower_wick = np.minimum(out["Open"], close) - low
 
     out["ret_1d"] = close.pct_change()
     out["ret_3d"] = close.pct_change(3)
@@ -355,6 +363,9 @@ def _build_feature_df(df: pd.DataFrame, horizon_steps: int, target_ret_min: floa
     out["vol_ratio"] = (vol / vol_ma20).clip(0.1, 5.0).fillna(1.0)
     out["atr14"] = compute_atr(out, 14)
     out["atr_pct"] = out["atr14"] / close.replace(0, np.nan)
+    out["range_pos_20"] = ((close - low_20) / (high_20 - low_20).replace(0, np.nan)).clip(0.0, 1.0).fillna(0.5)
+    out["upper_wick_ratio"] = (upper_wick / bar_range).clip(0.0, 1.0).fillna(0.0)
+    out["lower_wick_ratio"] = (lower_wick / bar_range).clip(0.0, 1.0).fillna(0.0)
 
     out["future_ret"] = close.shift(-horizon_steps) / close - 1.0
     out["target"] = (out["future_ret"] > target_ret_min).astype(int)
@@ -364,7 +375,8 @@ def _build_feature_df(df: pd.DataFrame, horizon_steps: int, target_ret_min: floa
 FEATURE_COLS = [
     "ret_1d", "ret_3d", "ret_5d",
     "ma10_gap", "ma20_gap", "ma20_slope",
-    "rsi14", "macd_hist", "vol_20", "vol_ratio", "atr_pct"
+    "rsi14", "macd_hist", "vol_20", "vol_ratio", "atr_pct",
+    "range_pos_20", "upper_wick_ratio", "lower_wick_ratio"
 ]
 
 
@@ -434,6 +446,7 @@ def _decide_signal(
         or rsi_now <= 35.0
         or chg_pct >= (2.5 if is_intraday_scalp else 5.0)
     )
+    near_resistance_stall = (range_pos_pct >= 82.0 and chg_pct <= 0.4)
 
     if extreme_high_risk or indecisive_conflict:
         direction = "建議先不做單"
@@ -441,7 +454,16 @@ def _decide_signal(
         stop_loss = round(entry_price - stop_mult * atr_val, 4)
         take_profit = round(entry_price + tp_mult * atr_val, 4)
         rr_ratio = round(tp_mult / max(stop_mult, 1e-8), 2)
-        action = "極短線波動與槓桿風險過高，建議先空手觀望，不硬做單" if extreme_high_risk else "訊號處於五五波與多空拉鋸，建議先不做單"
+        action = "波動/槓桿風險過高，易出現假突破與插針，建議先觀望" if extreme_high_risk else "訊號處於五五波與多空拉鋸，建議先不做單"
+    elif blended_prob >= profile["bull_threshold"] and near_resistance_stall:
+        direction = "高檔阻力留意回落"
+        entry_price = round(last_price - max(entry_mult * 1.25, 0.30) * atr_val, 4)
+        stop_loss = round(entry_price - stop_mult * atr_val, 4)
+        take_profit = round(entry_price + tp_mult * atr_val, 4)
+        risk_per_unit = max(entry_price - stop_loss, 1e-8)
+        reward_per_unit = max(take_profit - entry_price, 0.0)
+        rr_ratio = round(reward_per_unit / risk_per_unit, 2)
+        action = f"接近區間高檔阻力但動能未加速，防假突破，等回測 {entry_price} 再評估"
     elif blended_prob >= profile["bull_threshold"]:
         direction = "偏多看漲"
         if is_bottom_zone or (range_pos_pct <= 18.0 and rsi_now <= 32.0):
@@ -449,7 +471,7 @@ def _decide_signal(
             entry_hint = f"處於低檔止跌區，可評估現價 {entry_price} 附近進場"
         else:
             entry_price = round(last_price - max(entry_mult, 0.25) * atr_val, 4)
-            entry_hint = f"建議等回測 {entry_price} 附近偏多掛單"
+            entry_hint = f"順勢偏多，防衝高假突破，建議等回測 {entry_price} 附近掛單"
         stop_loss = round(entry_price - stop_mult * atr_val, 4)
         take_profit = round(entry_price + tp_mult * atr_val, 4)
         risk_per_unit = max(entry_price - stop_loss, 1e-8)
@@ -463,7 +485,7 @@ def _decide_signal(
             entry_hint = f"處於高檔轉弱區，可評估現價 {entry_price} 附近偏空"
         else:
             entry_price = round(last_price + max(entry_mult, 0.25) * atr_val, 4)
-            entry_hint = f"建議等反彈至 {entry_price} 附近偏空掛單"
+            entry_hint = f"順勢偏空，建議等反彈至 {entry_price} 附近掛單"
         stop_loss = round(entry_price + stop_mult * atr_val, 4)
         take_profit = round(entry_price - tp_mult * atr_val, 4)
         risk_per_unit = max(stop_loss - entry_price, 1e-8)
@@ -480,7 +502,7 @@ def _decide_signal(
             entry_price = round(max(low_20, last_price - support_pullback), 4)
             if entry_price >= last_price:
                 entry_price = round(last_price - support_pullback, 4)
-            entry_hint = f"不追空，若要接反彈可等 {entry_price} 支撐區"
+            entry_hint = f"不逆勢盲目抄底也不追空，若要接反彈等 {entry_price} 支撐區"
         min_buf = max(stop_mult * atr_val, entry_price * profile["min_stop_pct"])
         raw_stop = min(entry_price - min_buf, low_20 - 0.25 * atr_val)
         stop_loss = round(max(raw_stop, entry_price - max(stop_mult * 1.25, 1.0) * atr_val), 4)
@@ -490,14 +512,14 @@ def _decide_signal(
         risk_per_unit = max(entry_price - stop_loss, 1e-8)
         reward_per_unit = max(take_profit - entry_price, 0.0)
         rr_ratio = round(reward_per_unit / risk_per_unit, 2)
-        action = f"{entry_hint}，禁止低點追空"
+        action = f"{entry_hint}，防假跌破與連續下殺"
     else:
         direction = "震盪中性"
         entry_price = round(last_price, 4) if is_bottom_zone else round(last_price - max(entry_mult, 0.25) * atr_val, 4)
         stop_loss = round(entry_price - stop_mult * atr_val, 4)
         take_profit = round(entry_price + tp_mult * atr_val, 4)
         rr_ratio = round(tp_mult / max(stop_mult, 1e-8), 2)
-        action = f"震盪觀望，參考進場點 {entry_price}（盈虧比 1:{rr_ratio}）"
+        action = f"震盪區間易有假動作，參考進場點 {entry_price}（盈虧比 1:{rr_ratio}）"
 
     return direction, action, entry_price, stop_loss, take_profit, rr_ratio, chg_pct
 
