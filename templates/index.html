@@ -64,21 +64,25 @@
       cursor: pointer;
     }
     .chip:active { transform: scale(0.98); }
-    .btn-row { display: grid; grid-template-columns: 1.35fr 1fr; gap: 8px; }
+    .btn-row { display: grid; grid-template-columns: 1.2fr 1fr 1fr; gap: 8px; }
     .btn {
       width: 100%;
-      padding: 12px;
+      padding: 11px 8px;
       border: none;
       border-radius: 12px;
       background: var(--accent);
       color: #061224;
       font-weight: 700;
-      font-size: 0.98rem;
+      font-size: 0.92rem;
       cursor: pointer;
     }
     .btn-rec {
       background: linear-gradient(135deg, #22c55e, #16a34a);
       color: #052e16;
+    }
+    .btn-bt {
+      background: linear-gradient(135deg, #f59e0b, #d97706);
+      color: #1c1003;
     }
     .btn:disabled { opacity: 0.6; cursor: not-allowed; }
     .track-row {
@@ -190,12 +194,13 @@
 
       <div class="btn-row">
         <button id="runBtn" type="button" class="btn">開始分析</button>
-        <button id="recBtn" type="button" class="btn btn-rec">⭐ 篩選高勝率推薦</button>
+        <button id="recBtn" type="button" class="btn btn-rec">⭐ 高勝率推薦</button>
+        <button id="btBtn" type="button" class="btn btn-bt">📊 回測準確率</button>
       </div>
     </div>
 
     <div id="resultArea"></div>
-    <div class="disclaimer">僅供量化分析與風控參考，不構成投資建議；高勝率門檻仍不保證獲利，請嚴控風險。</div>
+    <div class="disclaimer">僅供量化分析與風控參考，不構成投資建議；歷史回測不代表未來保證。</div>
   </div>
 
   <script id="presets-data" type="application/json">{{ presets_json | safe }}</script>
@@ -205,6 +210,7 @@
     function setButtonsDisabled(disabled) {
       document.getElementById("runBtn").disabled = disabled;
       document.getElementById("recBtn").disabled = disabled;
+      document.getElementById("btBtn").disabled = disabled;
     }
 
     function renderPresets() {
@@ -317,14 +323,86 @@
         renderRecommendations(data);
       } catch (err) {
         const msg = err && err.name === "AbortError"
-          ? "掃描逾時，請再按一次「篩選高勝率推薦」"
+          ? "掃描逾時，請再按一次「⭐ 高勝率推薦」"
           : (err && err.message ? err.message : "未知錯誤");
         area.innerHTML = `<div class="card err">❌ ${msg}</div>`;
       } finally {
         clearTimeout(timer);
         setButtonsDisabled(false);
-        btn.textContent = "⭐ 篩選高勝率推薦";
+        btn.textContent = "⭐ 高勝率推薦";
       }
+    }
+
+    async function runBacktest() {
+      const btn = document.getElementById("btBtn");
+      const area = document.getElementById("resultArea");
+      const symVal = (document.getElementById("symbol").value || "BTC-USD").trim();
+      const daysVal = Number(document.getElementById("days").value || 0.1);
+
+      setButtonsDisabled(true);
+      btn.textContent = "回測中...";
+      area.innerHTML = `<div class="card">正在對 <b>${symVal}</b>（${daysVal}日）進行歷史逐筆停損停利回測，請稍候...</div>`;
+
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 90000);
+
+      try {
+        const payload = {
+          market: document.getElementById("market").value,
+          symbol: symVal,
+          days: daysVal,
+          leverage: document.getElementById("leverage").value,
+        };
+        const resp = await fetch("/api/backtest", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+          signal: controller.signal,
+        });
+        const rawText = await resp.text();
+        let data = {};
+        try {
+          data = rawText ? JSON.parse(rawText) : {};
+        } catch (_) {
+          throw new Error(`伺服器回應格式異常（狀態碼 ${resp.status}）`);
+        }
+        if (!resp.ok || data.error) {
+          throw new Error(data.error || `回測失敗（狀態碼 ${resp.status}）`);
+        }
+        renderBacktest(data);
+      } catch (err) {
+        const msg = err && err.name === "AbortError"
+          ? "回測逾時，請再按一次「📊 回測準確率」"
+          : (err && err.message ? err.message : "未知錯誤");
+        area.innerHTML = `<div class="card err">❌ ${msg}</div>`;
+      } finally {
+        clearTimeout(timer);
+        setButtonsDisabled(false);
+        btn.textContent = "📊 回測準確率";
+      }
+    }
+
+    function renderBacktest(b) {
+      const winClass = b.win_rate_pct >= 55 ? "tag-up" : (b.win_rate_pct >= 45 ? "tag-warn" : "tag-down");
+      const avgClass = b.avg_return_pct >= 0 ? "tag-up" : "tag-down";
+      document.getElementById("resultArea").innerHTML = `
+        <div class="card">
+          <div class="track-row">
+            <span class="track-badge">📊 歷史回測：${b.symbol}（${b.target_days}日・${b.leverage}x）</span>
+            <span class="rr-badge">${b.timeframe}</span>
+          </div>
+          <div class="metrics">
+            <div class="metric"><div class="k">實際交易勝率</div><div class="v ${winClass}">${b.win_rate_pct}%</div></div>
+            <div class="metric"><div class="k">每筆平均報酬（含手續費）</div><div class="v ${avgClass}">${b.avg_return_pct >= 0 ? "+" : ""}${b.avg_return_pct}%</div></div>
+            <div class="metric"><div class="k">獲利因子（Profit Factor）</div><div class="v">${b.profit_factor}</div></div>
+            <div class="metric"><div class="k">最大回撤（Max DD）</div><div class="v tag-down">-${b.max_drawdown_pct}%</div></div>
+          </div>
+          <div class="metrics" style="margin-top:8px;">
+            <div class="metric"><div class="k">評估訊號點數</div><div class="v">${b.bars_tested}</div></div>
+            <div class="metric"><div class="k">實際出手筆數</div><div class="v">${b.trade_count}</div></div>
+          </div>
+          <div class="rec-meta" style="margin-top:10px;">${b.note || ""}</div>
+        </div>`;
     }
 
     function renderRecommendations(data) {
@@ -465,6 +543,7 @@
       });
       document.getElementById("runBtn").addEventListener("click", runAnalyze);
       document.getElementById("recBtn").addEventListener("click", runRecommend);
+      document.getElementById("btBtn").addEventListener("click", runBacktest);
       renderPresets();
     });
   </script>
