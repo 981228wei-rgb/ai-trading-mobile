@@ -80,6 +80,9 @@ TRACK_PROFILES = {
         "target_ret_min": 0.008,
         "max_risk_pct": 0.010,
         "min_stop_pct": 0.010,
+        "extreme_atr_pct": 0.085,
+        "extreme_lev": 5.0,
+        "extreme_move_pct": 12.0,
     },
     "股票": {
         "track_name": "股票軌（順均線・控波段）",
@@ -91,6 +94,9 @@ TRACK_PROFILES = {
         "target_ret_min": 0.003,
         "max_risk_pct": 0.015,
         "min_stop_pct": 0.008,
+        "extreme_atr_pct": 0.065,
+        "extreme_lev": 3.0,
+        "extreme_move_pct": 10.0,
     },
 }
 
@@ -146,8 +152,8 @@ def analyze_price_structure(df: pd.DataFrame, last_price: float) -> dict:
     last_bar = df.iloc[-1]
 
     open_p = float(last_bar["Open"])
-    high_p = float(last_bar["High"])
-    low_p = float(last_bar["Low"])
+    high_p = max(float(last_bar["High"]), float(last_price))
+    low_p = min(float(last_bar["Low"]), float(last_price))
     close_p = float(last_price)
 
     total_range = max(high_p - low_p, 1e-8)
@@ -176,8 +182,8 @@ def analyze_price_structure(df: pd.DataFrame, last_price: float) -> dict:
     else:
         ma_structure = "短線偏弱（跌破 MA20，留意下方支撐）"
 
-    high_20 = float(recent["High"].max())
-    low_20 = float(recent["Low"].min())
+    high_20 = max(float(recent["High"].max()), close_p)
+    low_20 = min(float(recent["Low"].min()), close_p)
     range_20 = max(high_20 - low_20, 1e-8)
     pos_in_range = round(float(np.clip((close_p - low_20) / range_20 * 100.0, 0.0, 100.0)), 1)
 
@@ -407,15 +413,51 @@ def run_prediction(market: str, raw_symbol: str, target_days: int = 3, leverage=
     prev_price = float(close.iloc[-2]) if len(close) >= 2 else last_price
     chg_1d_pct = ((last_price - prev_price) / prev_price * 100.0) if prev_price else 0.0
 
+    structure_info = analyze_price_structure(df, last_price)
+    rsi_now = float(df["rsi14"].iloc[-1]) if pd.notna(df["rsi14"].iloc[-1]) else 50.0
+    ma20_now = float(df["ma20"].iloc[-1]) if pd.notna(df["ma20"].iloc[-1]) else last_price
+    ma60_now = float(df["ma60"].iloc[-1]) if pd.notna(df["ma60"].iloc[-1]) else last_price
+
     atr_val = float(df["atr14"].iloc[-1]) if pd.notna(df["atr14"].iloc[-1]) else last_price * 0.02
+    atr_pct_now = atr_val / max(last_price, 1e-8)
     vol_val = float(df["vol_20"].iloc[-1]) if pd.notna(df["vol_20"].iloc[-1]) else 0.02
     expected_move_pct = float(vol_val * np.sqrt(target_days) * 100.0)
+
+    lev_val = float(leverage) if (leverage is not None and leverage > 0) else 1.0
+
+    # 嚴格門檻：僅在「極端高風險」或「完全無法判斷走勢（訊號互打架＋低準確＋50%死區）」時建議先不做單
+    extreme_high_risk = (
+        atr_pct_now >= profile["extreme_atr_pct"]
+        and (lev_val >= profile["extreme_lev"] or abs(chg_1d_pct) >= profile["extreme_move_pct"])
+    )
+    indecisive_conflict = (
+        abs(blended_prob - 0.50) <= 0.03
+        and test_acc < 0.48
+        and abs(news_info["score"]) >= 0.25
+        and ((news_info["score"] > 0 and prob_up < 0.48) or (news_info["score"] < 0 and prob_up > 0.52))
+    )
 
     entry_mult = profile["entry_atr_mult"]
     stop_mult = profile["stop_atr_mult"]
     tp_mult = profile["tp_atr_mult"]
 
-    if blended_prob >= profile["bull_threshold"]:
+    low_zone_no_short = (
+        structure_info["range_pos_pct"] <= 20.0
+        or rsi_now <= 35.0
+        or chg_1d_pct >= 5.0
+    )
+
+    if extreme_high_risk or indecisive_conflict:
+        direction = "建議先不做單"
+        entry_price = round(last_price, 4)
+        stop_loss = round(last_price - stop_mult * atr_val, 4)
+        take_profit = round(last_price + tp_mult * atr_val, 4)
+        rr_ratio = round(tp_mult / max(stop_mult, 1e-8), 2)
+        if extreme_high_risk:
+            action = "波動與風險處於極端高檔，建議先空手觀望，不硬做單"
+        else:
+            action = "模型機率卡在五五波、驗證偏弱且消息與技術互打架，建議先不做單"
+    elif blended_prob >= profile["bull_threshold"]:
         direction = "偏多看漲"
         entry_price = round(min(last_price, last_price - entry_mult * atr_val), 4)
         stop_loss = round(entry_price - stop_mult * atr_val, 4)
@@ -424,7 +466,7 @@ def run_prediction(market: str, raw_symbol: str, target_days: int = 3, leverage=
         reward_per_unit = max(take_profit - entry_price, 0.0)
         rr_ratio = round(reward_per_unit / risk_per_unit, 2)
         action = f"回測偏多（停損 {stop_mult:.2f} ATR / 停利 {tp_mult:.2f} ATR，盈虧比 1:{rr_ratio}）"
-    elif blended_prob <= profile["bear_threshold"]:
+    elif blended_prob <= profile["bear_threshold"] and not low_zone_no_short:
         direction = "偏空看跌"
         entry_price = round(max(last_price, last_price + entry_mult * atr_val), 4)
         stop_loss = round(entry_price + stop_mult * atr_val, 4)
@@ -433,6 +475,13 @@ def run_prediction(market: str, raw_symbol: str, target_days: int = 3, leverage=
         reward_per_unit = max(entry_price - take_profit, 0.0)
         rr_ratio = round(reward_per_unit / risk_per_unit, 2)
         action = f"反彈偏空（停損 {stop_mult:.2f} ATR / 停利 {tp_mult:.2f} ATR，盈虧比 1:{rr_ratio}）"
+    elif blended_prob <= profile["bear_threshold"] and low_zone_no_short:
+        direction = "低點防反彈（不追空）"
+        entry_price = round(last_price, 4)
+        stop_loss = round(max(structure_info["low_20"], last_price - stop_mult * atr_val), 4)
+        take_profit = round(last_price + tp_mult * atr_val, 4)
+        rr_ratio = round(tp_mult / max(stop_mult, 1e-8), 2)
+        action = "處於低位/超賣或急拉區，禁止低點追空，等反彈遇阻再看"
     else:
         direction = "震盪中性"
         entry_price = round(last_price, 4)
@@ -443,25 +492,20 @@ def run_prediction(market: str, raw_symbol: str, target_days: int = 3, leverage=
 
     risk_box = None
     if capital is not None and capital > 0:
-        lev = float(leverage) if (leverage is not None and leverage > 0) else 1.0
         max_risk_amt = capital * profile["max_risk_pct"]
         stop_dist = abs(entry_price - stop_loss)
         stop_dist_pct = max(stop_dist / max(entry_price, 1e-8), profile["min_stop_pct"])
-        suggested_notional = min(capital * lev, max_risk_amt / stop_dist_pct)
+        suggested_notional = min(capital * lev_val, max_risk_amt / stop_dist_pct)
         suggested_units = suggested_notional / entry_price if entry_price > 0 else 0.0
         risk_box = {
             "capital": round(capital, 2),
-            "leverage": round(lev, 2),
+            "leverage": round(lev_val, 2),
             "risk_pct_label": f"{profile['max_risk_pct'] * 100:.1f}%",
             "max_risk_2pct": round(max_risk_amt, 2),
             "suggested_notional": round(suggested_notional, 2),
             "suggested_units": round(suggested_units, 6),
         }
 
-    structure_info = analyze_price_structure(df, last_price)
-    rsi_now = float(df["rsi14"].iloc[-1]) if pd.notna(df["rsi14"].iloc[-1]) else 50.0
-    ma20_now = float(df["ma20"].iloc[-1]) if pd.notna(df["ma20"].iloc[-1]) else last_price
-    ma60_now = float(df["ma60"].iloc[-1]) if pd.notna(df["ma60"].iloc[-1]) else last_price
     taipei_now = datetime.now(ZoneInfo("Asia/Taipei")).strftime("%Y-%m-%d %H:%M:%S")
 
     return {
