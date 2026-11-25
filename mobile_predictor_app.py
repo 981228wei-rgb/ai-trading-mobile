@@ -87,8 +87,8 @@ TRACK_PROFILES = {
     },
     "加密貨幣_極短線": {
         "track_name": "加密貨幣極短線軌（高槓桿・緊停損防洗盤）",
-        "bull_threshold": 0.57,
-        "bear_threshold": 0.43,
+        "bull_threshold": 0.62,
+        "bear_threshold": 0.38,
         "entry_atr_mult": 0.20,
         "stop_atr_mult": 0.85,
         "tp_atr_mult": 1.65,
