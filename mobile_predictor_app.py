@@ -309,7 +309,6 @@ def fetch_history_df(symbol: str, use_intraday: bool = False) -> pd.DataFrame:
         except Exception:
             df = None
 
-    # 若小時線抓不到，自動退回日線避免報錯
     if (df is None or df.empty) and use_intraday:
         try:
             df = yf.Ticker(symbol).history(period="2y", interval="1d", auto_adjust=True)
@@ -361,7 +360,6 @@ def run_prediction(market: str, raw_symbol: str, target_days=3, leverage=None, c
     symbol = normalize_symbol(market, raw_symbol)
 
     is_intraday_scalp = (market == "加密貨幣" and target_days < 1.0)
-    # 0.1 天 ≈ 2.4 小時，換算為 1h K 線的步數（至少 2 根）
     horizon_steps = max(2, int(round(target_days * 24))) if is_intraday_scalp else max(1, int(round(target_days)))
 
     with ThreadPoolExecutor(max_workers=3) as pool:
