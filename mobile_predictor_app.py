@@ -71,7 +71,7 @@ MARKET_PRESETS = {
 
 TRACK_PROFILES = {
     "加密貨幣": {
-        "track_name": "加密貨幣軌（結構控損・高盈虧比）",
+        "track_name": "加密貨幣軌（四維濾網・結構控損）",
         "bull_threshold": 0.58,
         "bear_threshold": 0.42,
         "entry_atr_mult": 0.35,
@@ -86,22 +86,22 @@ TRACK_PROFILES = {
         "fee_rate": 0.0005,
     },
     "加密貨幣_極短線": {
-        "track_name": "加密貨幣極短線軌（高槓桿・緊停損防洗盤）",
-        "bull_threshold": 0.595,
-        "bear_threshold": 0.405,
-        "entry_atr_mult": 0.20,
-        "stop_atr_mult": 0.85,
-        "tp_atr_mult": 1.65,
-        "target_ret_min": 0.0025,
-        "max_risk_pct": 0.006,
-        "min_stop_pct": 0.004,
-        "extreme_atr_pct": 0.035,
+        "track_name": "加密貨幣極短線軌（四維濾網・防軋空緊控損）",
+        "bull_threshold": 0.60,
+        "bear_threshold": 0.39,
+        "entry_atr_mult": 0.22,
+        "stop_atr_mult": 0.90,
+        "tp_atr_mult": 1.75,
+        "target_ret_min": 0.003,
+        "max_risk_pct": 0.005,
+        "min_stop_pct": 0.005,
+        "extreme_atr_pct": 0.032,
         "extreme_lev": 10.0,
-        "extreme_move_pct": 6.0,
+        "extreme_move_pct": 5.0,
         "fee_rate": 0.0006,
     },
     "股票": {
-        "track_name": "股票軌（順均線・控波段）",
+        "track_name": "股票軌（四維濾網・順均線與基本面）",
         "bull_threshold": 0.55,
         "bear_threshold": 0.45,
         "entry_atr_mult": 0.30,
@@ -179,6 +179,7 @@ def analyze_price_structure(df: pd.DataFrame, last_price: float, range_label: st
     body = abs(close_p - open_p)
     upper_wick = max(high_p - max(open_p, close_p), 0.0)
     lower_wick = max(min(open_p, close_p) - low_p, 0.0)
+    lower_wick_ratio = round(float(lower_wick / total_range), 3)
 
     if lower_wick >= total_range * 0.45 and lower_wick > upper_wick * 1.5:
         candle_signal = "長下影線（下檔有承接/防插針）"
@@ -212,6 +213,7 @@ def analyze_price_structure(df: pd.DataFrame, last_price: float, range_label: st
         "high_20": round(high_20, 4),
         "low_20": round(low_20, 4),
         "range_pos_pct": pos_in_range,
+        "lower_wick_ratio": lower_wick_ratio,
         "range_label": range_label,
         "summary": f"{ma_structure}｜{candle_signal}｜{range_label}區間 {pos_in_range}%",
     }
@@ -295,6 +297,242 @@ def score_news(headlines):
     else:
         label = f"中性 ({avg_score:+.2f})"
     return {"score": round(avg_score, 3), "label": label, "items": items}
+
+
+def _safe_last_and_chg(ticker_sym: str):
+    try:
+        hist = yf.Ticker(ticker_sym).history(period="5d", interval="1d", auto_adjust=True)
+        if hist is None or hist.empty:
+            return None, 0.0
+        if isinstance(hist.columns, pd.MultiIndex):
+            hist.columns = hist.columns.get_level_values(0)
+        closes = hist["Close"].dropna()
+        if len(closes) == 0:
+            return None, 0.0
+        last_v = float(closes.iloc[-1])
+        prev_v = float(closes.iloc[-2]) if len(closes) >= 2 else last_v
+        chg_pct = ((last_v - prev_v) / prev_v * 100.0) if prev_v else 0.0
+        return last_v, chg_pct
+    except Exception:
+        return None, 0.0
+
+
+def fetch_macro_context(market: str) -> dict:
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        vix_fut = pool.submit(_safe_last_and_chg, "^VIX")
+        dxy_fut = pool.submit(_safe_last_and_chg, "DX-Y.NYB")
+        tnx_fut = pool.submit(_safe_last_and_chg, "^TNX")
+        vix_val, vix_chg = vix_fut.result()
+        dxy_val, dxy_chg = dxy_fut.result()
+        tnx_val, tnx_chg = tnx_fut.result()
+
+    score = 0.0
+    notes = []
+
+    if vix_val is not None:
+        if vix_val >= 28.0 or vix_chg >= 8.0:
+            score -= 0.45
+            notes.append(f"VIX 偏高 ({vix_val:.1f}, {vix_chg:+.1f}%) 風險升溫")
+        elif vix_val >= 22.0:
+            score -= 0.20
+            notes.append(f"VIX 中高檔 ({vix_val:.1f}) 波動警戒")
+        elif vix_val <= 15.5:
+            score += 0.25
+            notes.append(f"VIX 溫和 ({vix_val:.1f}) 風險偏好較穩")
+        else:
+            notes.append(f"VIX {vix_val:.1f} ({vix_chg:+.1f}%)")
+
+    if dxy_val is not None:
+        if dxy_chg >= 0.6:
+            score -= 0.25 if market == "加密貨幣" else 0.15
+            notes.append(f"美元走強 ({dxy_chg:+.2f}%) 壓抑風險資產")
+        elif dxy_chg <= -0.6:
+            score += 0.25 if market == "加密貨幣" else 0.15
+            notes.append(f"美元轉弱 ({dxy_chg:+.2f}%) 流動性較友善")
+
+    if tnx_val is not None:
+        if tnx_chg >= 2.5:
+            score -= 0.20
+            notes.append(f"美債殖利率彈升 ({tnx_val:.2f}%, {tnx_chg:+.1f}%) 估值承壓")
+        elif tnx_chg <= -2.5:
+            score += 0.15
+            notes.append(f"美債殖利率回落 ({tnx_val:.2f}%, {tnx_chg:+.1f}%)")
+
+    score = float(np.clip(score, -1.0, 1.0))
+    if score >= 0.20:
+        regime = "偏多順風"
+    elif score <= -0.25:
+        regime = "偏空逆風/高警戒"
+    else:
+        regime = "中性震盪"
+
+    summary = "｜".join(notes) if notes else "宏觀指標中性"
+    return {
+        "score": round(score, 3),
+        "regime": regime,
+        "summary": summary,
+        "vix": round(vix_val, 2) if vix_val is not None else None,
+        "dxy_chg_pct": round(dxy_chg, 2) if dxy_val is not None else None,
+        "tnx_yield": round(tnx_val, 2) if tnx_val is not None else None,
+        "risk_off": score <= -0.35 or (vix_val is not None and vix_val >= 28.0),
+    }
+
+
+def fetch_fundamental_context(market: str, symbol: str, prob_up: float, ma20_gap: float) -> dict:
+    if market == "加密貨幣":
+        if ma20_gap <= -0.12 and prob_up >= 0.55:
+            score = 0.25
+            status = "偏多（深蹲折價修復）"
+        elif ma20_gap >= 0.15:
+            score = -0.25
+            status = "偏高（短線乖離偏大）"
+        else:
+            score = float(np.clip(ma20_gap * 1.5, -0.3, 0.3))
+            status = "中性（以量價與籌碼結構為主）"
+        return {
+            "score": round(score, 3),
+            "status": status,
+            "summary": f"加密資產以均線乖離與量價結構評估：{status}",
+            "pe": None,
+            "roe_pct": None,
+            "pb": None,
+        }
+
+    try:
+        info = yf.Ticker(symbol).info or {}
+    except Exception:
+        info = {}
+
+    pe = info.get("forwardPE") or info.get("trailingPE")
+    pb = info.get("priceToBook")
+    roe = info.get("returnOnEquity")
+    rev_growth = info.get("revenueGrowth")
+    debt_to_equity = info.get("debtToEquity")
+
+    score = 0.0
+    parts = []
+
+    if isinstance(pe, (int, float)) and np.isfinite(pe) and pe > 0:
+        if pe <= 18:
+            score += 0.25
+            parts.append(f"PE {pe:.1f}x（估值合理/偏低）")
+        elif pe >= 45:
+            score -= 0.25
+            parts.append(f"PE {pe:.1f}x（估值偏高）")
+        else:
+            parts.append(f"PE {pe:.1f}x")
+
+    if isinstance(roe, (int, float)) and np.isfinite(roe):
+        roe_pct = roe * 100.0 if abs(roe) <= 2.5 else float(roe)
+        if roe_pct >= 15.0:
+            score += 0.25
+            parts.append(f"ROE {roe_pct:.1f}%（獲利穩健）")
+        elif roe_pct < 5.0:
+            score -= 0.20
+            parts.append(f"ROE {roe_pct:.1f}%（獲利偏弱）")
+        else:
+            parts.append(f"ROE {roe_pct:.1f}%")
+    else:
+        roe_pct = None
+
+    if isinstance(pb, (int, float)) and np.isfinite(pb) and pb > 0:
+        if pb <= 2.0:
+            score += 0.15
+            parts.append(f"PB {pb:.2f}x")
+        elif pb >= 12.0:
+            score -= 0.15
+            parts.append(f"PB {pb:.2f}x（淨值溢價高）")
+
+    if isinstance(rev_growth, (int, float)) and np.isfinite(rev_growth):
+        rg_pct = rev_growth * 100.0 if abs(rev_growth) <= 3.0 else float(rev_growth)
+        if rg_pct >= 15.0:
+            score += 0.15
+            parts.append(f"營收成長 {rg_pct:+.1f}%")
+        elif rg_pct <= -10.0:
+            score -= 0.20
+            parts.append(f"營收衰退 {rg_pct:+.1f}%")
+
+    if isinstance(debt_to_equity, (int, float)) and np.isfinite(debt_to_equity) and debt_to_equity > 250:
+        score -= 0.10
+        parts.append(f"負債比偏高 ({debt_to_equity:.0f})")
+
+    score = float(np.clip(score, -1.0, 1.0))
+    if score >= 0.25:
+        status = "基本面偏強"
+    elif score <= -0.25:
+        status = "基本面偏弱/估值緊繃"
+    else:
+        status = "基本面中性"
+
+    summary = "｜".join(parts) if parts else "基本面財務數據中性或為 ETF/指數標的"
+    return {
+        "score": round(score, 3),
+        "status": status,
+        "summary": summary,
+        "pe": round(float(pe), 1) if isinstance(pe, (int, float)) and np.isfinite(pe) and pe > 0 else None,
+        "roe_pct": round(float(roe_pct), 1) if roe_pct is not None else None,
+        "pb": round(float(pb), 2) if isinstance(pb, (int, float)) and np.isfinite(pb) and pb > 0 else None,
+    }
+
+
+def score_technical(prob_up: float, ma20_now: float, ma60_now: float, last_price: float, rsi_now: float, range_pos_pct: float) -> dict:
+    ml_bias = (prob_up - 0.5) * 1.4
+    trend_bias = 0.0
+    if last_price > ma20_now and ma20_now > ma60_now:
+        trend_bias = 0.30
+    elif last_price < ma20_now and ma20_now < ma60_now:
+        trend_bias = -0.30
+    elif last_price >= ma20_now:
+        trend_bias = 0.12
+    else:
+        trend_bias = -0.12
+
+    pos_bias = 0.0
+    if range_pos_pct <= 18.0:
+        pos_bias = 0.12
+    elif range_pos_pct >= 82.0:
+        pos_bias = -0.12
+
+    score = float(np.clip(ml_bias + trend_bias + pos_bias, -1.0, 1.0))
+    if score >= 0.22:
+        status = "技術面偏多"
+    elif score <= -0.22:
+        status = "技術面偏空"
+    else:
+        status = "技術面震盪"
+    return {
+        "score": round(score, 3),
+        "status": status,
+        "summary": f"ML看漲 {prob_up*100:.1f}%｜RSI {rsi_now:.1f}｜區間 {range_pos_pct:.1f}%",
+    }
+
+
+def score_sentiment(news_score: float, rsi_now: float, chg_pct: float) -> dict:
+    rsi_adj = 0.0
+    if rsi_now >= 75.0:
+        rsi_adj = -0.25
+    elif rsi_now <= 25.0:
+        rsi_adj = 0.20
+
+    chg_adj = float(np.clip(chg_pct * 0.03, -0.25, 0.25))
+    score = float(np.clip(news_score * 0.65 + rsi_adj + chg_adj * 0.4, -1.0, 1.0))
+
+    if rsi_now >= 75.0:
+        status = "情緒偏熱（防追高）"
+    elif rsi_now <= 25.0:
+        status = "情緒偏冷/超賣（留意止跌與反轉）"
+    elif score >= 0.20:
+        status = "情緒偏多"
+    elif score <= -0.20:
+        status = "情緒偏空"
+    else:
+        status = "情緒中性"
+
+    return {
+        "score": round(score, 3),
+        "status": status,
+        "summary": f"新聞分數 {news_score:+.2f}｜短線動能 {chg_pct:+.2f}%｜RSI {rsi_now:.1f}",
+    }
 
 
 def fetch_history_df(symbol: str, use_intraday: bool = False) -> pd.DataFrame:
@@ -415,17 +653,39 @@ def _decide_signal(
     rsi_now: float,
     range_pos_pct: float,
     low_20: float,
+    ma10_now: float,
     ma20_now: float,
     ma60_now: float,
     lev_val: float,
     is_intraday_scalp: bool,
+    lower_wick_ratio: float = 0.0,
+    tech_score: float = 0.0,
+    fund_score: float = 0.0,
+    sent_score: float = 0.0,
+    macro_score: float = 0.0,
+    macro_risk_off: bool = False,
 ):
     chg_pct = ((last_price - prev_price) / prev_price * 100.0) if prev_price else 0.0
     atr_pct_now = atr_val / max(last_price, 1e-8)
 
-    # 結構與假跌破/二次測試判斷（參考大級別結構與插針收回邏輯）
+    four_dim_score = round(
+        tech_score * 0.35 + fund_score * 0.20 + sent_score * 0.20 + macro_score * 0.25,
+        3,
+    )
+
     broken_downtrend_structure = (last_price < ma20_now) and (ma20_now < ma60_now)
     sweep_and_reclaim = (range_pos_pct <= 15.0) and (last_price > low_20) and (chg_pct > -0.3)
+    spike_fade_risk = (chg_pct >= (2.2 if is_intraday_scalp else 3.8)) and (range_pos_pct >= 65.0 or rsi_now >= 68.0)
+    spike_whipsaw = (abs(chg_pct) >= (2.0 if is_intraday_scalp else 4.0)) and (atr_pct_now >= profile["extreme_atr_pct"] * 0.72)
+
+    # 防軋空/防反彈濾網：低位、下影線有承接或短線剛起漲（站上 MA10 且正動能）時不追空
+    short_squeeze_or_bounce_risk = (
+        range_pos_pct <= 28.0
+        or rsi_now <= 38.0
+        or lower_wick_ratio >= 0.35
+        or (last_price >= ma10_now and chg_pct > 0.25)
+        or chg_pct >= (1.5 if is_intraday_scalp else 4.5)
+    )
 
     extreme_high_risk = (
         atr_pct_now >= profile["extreme_atr_pct"]
@@ -437,6 +697,7 @@ def _decide_signal(
         and abs(news_score) >= 0.25
         and ((news_score > 0 and prob_up < 0.48) or (news_score < 0 and prob_up > 0.52))
     )
+    macro_headwind_block_long = macro_risk_off and (four_dim_score < 0.05) and (range_pos_pct > 20.0)
 
     entry_mult = profile["entry_atr_mult"]
     stop_mult = profile["stop_atr_mult"]
@@ -447,11 +708,6 @@ def _decide_signal(
         if is_intraday_scalp
         else ((range_pos_pct <= 12.0) or (rsi_now <= 25.0))
     )
-    low_zone_no_short = (
-        range_pos_pct <= 20.0
-        or rsi_now <= 35.0
-        or chg_pct >= (2.5 if is_intraday_scalp else 5.0)
-    )
     near_resistance_stall = (range_pos_pct >= 82.0 and chg_pct <= 0.4)
 
     if extreme_high_risk or indecisive_conflict:
@@ -460,7 +716,32 @@ def _decide_signal(
         stop_loss = round(entry_price - stop_mult * atr_val, 4)
         take_profit = round(entry_price + tp_mult * atr_val, 4)
         rr_ratio = round(tp_mult / max(stop_mult, 1e-8), 2)
-        action = "波動/槓桿風險過高，易出現插針與掃單，建議先觀望" if extreme_high_risk else "訊號處於五五波與多空拉鋸，建議先不做單"
+        action = "波動/槓桿風險過高，易出現多空雙殺與插針，建議先空倉觀望" if extreme_high_risk else "訊號處於五五波與多空拉鋸，建議先不做單"
+    elif spike_whipsaw:
+        direction = "急動插針先等收穩"
+        entry_price = round(last_price - np.sign(chg_pct) * max(entry_mult * 1.3, 0.35) * atr_val, 4)
+        stop_loss = round(entry_price - stop_mult * atr_val, 4) if chg_pct < 0 else round(entry_price + stop_mult * atr_val, 4)
+        take_profit = round(entry_price + tp_mult * atr_val, 4) if chg_pct < 0 else round(entry_price - tp_mult * atr_val, 4)
+        rr_ratio = round(tp_mult / max(stop_mult, 1e-8), 2)
+        action = f"短線急動易有第一根假針，不追單，等K線收穩再看 {entry_price} 附近"
+    elif spike_fade_risk and blended_prob >= profile["bull_threshold"]:
+        direction = "急拉防回落與二探"
+        entry_price = round(last_price - max(entry_mult * 1.35, 0.35) * atr_val, 4)
+        stop_loss = round(entry_price - stop_mult * atr_val, 4)
+        take_profit = round(entry_price + tp_mult * atr_val, 4)
+        risk_per_unit = max(entry_price - stop_loss, 1e-8)
+        reward_per_unit = max(take_profit - entry_price, 0.0)
+        rr_ratio = round(reward_per_unit / risk_per_unit, 2)
+        action = f"短線急拉後留意阻力回落與二探，不盲目追高，等回測/二探守穩 {entry_price} 再看"
+    elif blended_prob >= profile["bull_threshold"] and macro_headwind_block_long:
+        direction = "宏觀逆風留意回落"
+        entry_price = round(last_price - max(entry_mult * 1.4, 0.35) * atr_val, 4)
+        stop_loss = round(entry_price - stop_mult * atr_val, 4)
+        take_profit = round(entry_price + tp_mult * atr_val, 4)
+        risk_per_unit = max(entry_price - stop_loss, 1e-8)
+        reward_per_unit = max(take_profit - entry_price, 0.0)
+        rr_ratio = round(reward_per_unit / risk_per_unit, 2)
+        action = f"宏觀逆風/風險偏緊，反彈不戀戰，等回測 {entry_price} 再評估"
     elif blended_prob >= profile["bull_threshold"] and near_resistance_stall:
         direction = "高檔阻力留意回落"
         entry_price = round(last_price - max(entry_mult * 1.25, 0.30) * atr_val, 4)
@@ -474,47 +755,44 @@ def _decide_signal(
         direction = "偏多看漲"
         if broken_downtrend_structure and not is_bottom_zone:
             entry_price = round(last_price - max(entry_mult * 1.4, 0.35) * atr_val, 4)
-            entry_hint = f"空頭結構未完全修復，不急追高，等回測/二次測試 {entry_price} 再評估"
+            entry_hint = f"空頭結構未完全修復，反彈不盲目戀戰，等回測/二探 {entry_price}"
         elif is_bottom_zone or (range_pos_pct <= 18.0 and rsi_now <= 32.0):
             entry_price = round(last_price, 4)
-            entry_hint = "下探收回有承接跡象，可評估現價 " + f"{entry_price} 附近進場" if sweep_and_reclaim else f"處於低檔止跌區，可評估現價 {entry_price} 附近進場"
+            entry_hint = f"假跌破收回或二探有止跌跡象，可評估現價 {entry_price} 附近分批" if sweep_and_reclaim else f"處於低檔止跌區，可評估現價 {entry_price} 附近進場"
         else:
             entry_price = round(last_price - max(entry_mult, 0.25) * atr_val, 4)
-            entry_hint = f"順勢偏多，防衝高假突破，建議等回測 {entry_price} 附近掛單"
+            entry_hint = f"四維偏多（綜合 {four_dim_score:+.2f}），防衝高假突破，等回測 {entry_price} 掛單"
         stop_loss = round(entry_price - stop_mult * atr_val, 4)
         take_profit = round(entry_price + tp_mult * atr_val, 4)
         risk_per_unit = max(entry_price - stop_loss, 1e-8)
         reward_per_unit = max(take_profit - entry_price, 0.0)
         rr_ratio = round(reward_per_unit / risk_per_unit, 2)
         action = f"{entry_hint}（停損 {stop_mult:.2f} ATR / 停利 {tp_mult:.2f} ATR，盈虧比 1:{rr_ratio}）"
-    elif blended_prob <= profile["bear_threshold"] and not low_zone_no_short:
+    elif blended_prob <= profile["bear_threshold"] and not short_squeeze_or_bounce_risk:
         direction = "偏空看跌"
-        if range_pos_pct >= 85.0 and rsi_now >= 70.0:
+        if range_pos_pct >= 85.0 and rsi_now >= 70.0 and chg_pct <= 0.2:
             entry_price = round(last_price, 4)
-            entry_hint = f"處於高檔轉弱區，可評估現價 {entry_price} 附近偏空"
+            entry_hint = f"處於高檔轉弱區，反彈不戀戰，可評估現價 {entry_price} 附近偏空"
         else:
-            entry_price = round(last_price + max(entry_mult, 0.25) * atr_val, 4)
-            entry_hint = f"順勢偏空，建議等反彈至 {entry_price} 附近掛單"
+            entry_price = round(last_price + max(entry_mult * 1.15, 0.30) * atr_val, 4)
+            entry_hint = f"四維偏空（綜合 {four_dim_score:+.2f}），防短線反彈軋空，等反彈受阻至 {entry_price} 再評估"
         stop_loss = round(entry_price + stop_mult * atr_val, 4)
         take_profit = round(entry_price - tp_mult * atr_val, 4)
         risk_per_unit = max(stop_loss - entry_price, 1e-8)
         reward_per_unit = max(entry_price - take_profit, 0.0)
         rr_ratio = round(reward_per_unit / risk_per_unit, 2)
         action = f"{entry_hint}（停損 {stop_mult:.2f} ATR / 停利 {tp_mult:.2f} ATR，盈虧比 1:{rr_ratio}）"
-    elif blended_prob <= profile["bear_threshold"] and low_zone_no_short:
-        direction = "低點防反彈（不追空）"
+    elif blended_prob <= profile["bear_threshold"] and short_squeeze_or_bounce_risk:
+        direction = "防反彈軋空（不追空）"
         if is_bottom_zone and sweep_and_reclaim:
             entry_price = round(last_price, 4)
-            entry_hint = f"下探收回並現二次測試承接，若要接反彈可看現價 {entry_price} 附近"
-        elif is_bottom_zone:
-            entry_price = round(last_price, 4)
-            entry_hint = f"已貼近極端低位/超賣區，若要接反彈可看現價 {entry_price} 附近（控管風險）"
+            entry_hint = f"下探收回出現止跌跡象，短線防反彈軋空，不追空，留意現價 {entry_price} 附近"
         else:
             support_pullback = max(entry_mult * 1.35, 0.45) * atr_val
             entry_price = round(max(low_20, last_price - support_pullback), 4)
             if entry_price >= last_price:
                 entry_price = round(last_price - support_pullback, 4)
-            entry_hint = f"結構偏弱不盲目接刀也不追空，等 {entry_price} 支撐二次測試"
+            entry_hint = f"短線易有反彈或下影線承接，不盲目追空，等結構明朗或 {entry_price} 支撐確認"
         min_buf = max(stop_mult * atr_val, entry_price * profile["min_stop_pct"])
         raw_stop = min(entry_price - min_buf, low_20 - 0.25 * atr_val)
         stop_loss = round(max(raw_stop, entry_price - max(stop_mult * 1.25, 1.0) * atr_val), 4)
@@ -524,16 +802,16 @@ def _decide_signal(
         risk_per_unit = max(entry_price - stop_loss, 1e-8)
         reward_per_unit = max(take_profit - entry_price, 0.0)
         rr_ratio = round(reward_per_unit / risk_per_unit, 2)
-        action = f"{entry_hint}，防假跌破與連續下殺"
+        action = f"{entry_hint}，防逆勢急拉打停損"
     else:
         direction = "震盪中性"
         entry_price = round(last_price, 4) if is_bottom_zone else round(last_price - max(entry_mult, 0.25) * atr_val, 4)
         stop_loss = round(entry_price - stop_mult * atr_val, 4)
         take_profit = round(entry_price + tp_mult * atr_val, 4)
         rr_ratio = round(tp_mult / max(stop_mult, 1e-8), 2)
-        action = f"盤整區間易有插針洗盤，等區間方向明朗，參考點位 {entry_price}（盈虧比 1:{rr_ratio}）"
+        action = f"四維綜合 {four_dim_score:+.2f}（區間磨底/上下洗盤，控管槓桿與倉位），參考點位 {entry_price}（盈虧比 1:{rr_ratio}）"
 
-    return direction, action, entry_price, stop_loss, take_profit, rr_ratio, chg_pct
+    return direction, action, entry_price, stop_loss, take_profit, rr_ratio, chg_pct, four_dim_score
 
 
 def run_prediction(market: str, raw_symbol: str, target_days=3, leverage=None, capital=None):
@@ -545,13 +823,15 @@ def run_prediction(market: str, raw_symbol: str, target_days=3, leverage=None, c
     is_intraday_scalp = (market == "加密貨幣" and target_days < 1.0)
     horizon_steps = max(2, int(round(target_days * 24))) if is_intraday_scalp else max(1, int(round(target_days)))
 
-    with ThreadPoolExecutor(max_workers=3) as pool:
+    with ThreadPoolExecutor(max_workers=4) as pool:
         hist_fut = pool.submit(fetch_history_df, symbol, is_intraday_scalp)
         news_fut = pool.submit(fetch_news_headlines, symbol, 8)
         live_fut = pool.submit(fetch_live_price, symbol)
+        macro_fut = pool.submit(fetch_macro_context, market)
         df = hist_fut.result()
         headlines = news_fut.result()
         live_price = live_fut.result()
+        macro_info = macro_fut.result()
 
     if df is None or df.empty or len(df) < 60:
         raise ValueError(f"找不到 {symbol} 足夠的歷史行情資料，請確認代碼是否正確（例如 BTC-USD、NVDA、2330.TW）。")
@@ -587,25 +867,37 @@ def run_prediction(market: str, raw_symbol: str, target_days=3, leverage=None, c
     latest_row = feat_df[FEATURE_COLS].iloc[[-1]].ffill().bfill()
     prob_up = float(clf.predict_proba(latest_row)[0][1])
 
-    news_info = score_news(headlines)
-    news_adj = news_info["score"] * 0.08 if abs(news_info["score"]) >= 0.15 else 0.0
-    blended_prob = float(np.clip(prob_up + news_adj, 0.08, 0.92))
-
     last_price = live_price if live_price is not None else float(feat_df["Close"].iloc[-1])
     prev_price = float(feat_df["Close"].iloc[-2]) if len(feat_df) >= 2 else last_price
+    chg_1d_pct = ((last_price - prev_price) / prev_price * 100.0) if prev_price else 0.0
 
     range_label = "20根1h" if is_intraday_scalp else "20日"
     structure_info = analyze_price_structure(feat_df, last_price, range_label=range_label)
     rsi_now = float(feat_df["rsi14"].iloc[-1]) if pd.notna(feat_df["rsi14"].iloc[-1]) else 50.0
+    ma10_now = float(feat_df["ma10"].iloc[-1]) if pd.notna(feat_df["ma10"].iloc[-1]) else last_price
     ma20_now = float(feat_df["ma20"].iloc[-1]) if pd.notna(feat_df["ma20"].iloc[-1]) else last_price
     ma60_now = float(feat_df["ma60"].iloc[-1]) if pd.notna(feat_df["ma60"].iloc[-1]) else last_price
+    ma20_gap_now = (last_price - ma20_now) / max(ma20_now, 1e-8)
+
+    news_info = score_news(headlines)
+    fund_info = fetch_fundamental_context(market, symbol, prob_up, ma20_gap_now)
+    tech_info = score_technical(prob_up, ma20_now, ma60_now, last_price, rsi_now, structure_info["range_pos_pct"])
+    sent_info = score_sentiment(news_info["score"], rsi_now, chg_1d_pct)
+
+    four_dim_raw = (
+        tech_info["score"] * 0.35
+        + fund_info["score"] * 0.20
+        + sent_info["score"] * 0.20
+        + macro_info["score"] * 0.25
+    )
+    blended_prob = float(np.clip(prob_up + four_dim_raw * 0.14, 0.08, 0.92))
 
     atr_val = float(feat_df["atr14"].iloc[-1]) if pd.notna(feat_df["atr14"].iloc[-1]) else last_price * 0.01
     vol_val = float(feat_df["vol_20"].iloc[-1]) if pd.notna(feat_df["vol_20"].iloc[-1]) else 0.01
     expected_move_pct = float(vol_val * np.sqrt(horizon_steps) * 100.0)
     lev_val = float(leverage) if (leverage is not None and leverage > 0) else 1.0
 
-    direction, action, entry_price, stop_loss, take_profit, rr_ratio, chg_1d_pct = _decide_signal(
+    direction, action, entry_price, stop_loss, take_profit, rr_ratio, _, four_dim_score = _decide_signal(
         profile=profile,
         prob_up=prob_up,
         blended_prob=blended_prob,
@@ -617,15 +909,30 @@ def run_prediction(market: str, raw_symbol: str, target_days=3, leverage=None, c
         rsi_now=rsi_now,
         range_pos_pct=structure_info["range_pos_pct"],
         low_20=structure_info["low_20"],
+        ma10_now=ma10_now,
         ma20_now=ma20_now,
         ma60_now=ma60_now,
         lev_val=lev_val,
         is_intraday_scalp=is_intraday_scalp,
+        lower_wick_ratio=structure_info["lower_wick_ratio"],
+        tech_score=tech_info["score"],
+        fund_score=fund_info["score"],
+        sent_score=sent_info["score"],
+        macro_score=macro_info["score"],
+        macro_risk_off=macro_info["risk_off"],
     )
 
     news_score_val = news_info["score"]
-    news_aligned_bull = (blended_prob >= 0.64) and (news_score_val >= -0.10) and (prob_up >= 0.60)
-    news_aligned_bear = (blended_prob <= 0.36) and (news_score_val <= 0.10) and (prob_up <= 0.40)
+    high_lev_short_blocked = (direction == "偏空看跌") and (lev_val >= 10.0) and (chg_pct > -0.35 or structure_info["lower_wick_ratio"] >= 0.25)
+    news_aligned_bull = (blended_prob >= 0.65) and (news_score_val >= -0.10) and (prob_up >= 0.60) and (four_dim_score >= 0.12)
+    news_aligned_bear = (
+        (direction == "偏空看跌")
+        and (not high_lev_short_blocked)
+        and (blended_prob <= 0.35)
+        and (news_score_val <= 0.10)
+        and (prob_up <= 0.40)
+        and (four_dim_score <= -0.12)
+    )
     high_win_qualified = (
         direction in ("偏多看漲", "偏空看跌")
         and test_acc >= 0.56
@@ -670,6 +977,13 @@ def run_prediction(market: str, raw_symbol: str, target_days=3, leverage=None, c
         "win_prob_display": win_prob_display,
         "high_win_qualified": high_win_qualified,
         "edge_score": edge_score,
+        "four_dim_score": four_dim_score,
+        "dimensions": {
+            "technical": tech_info,
+            "fundamental": fund_info,
+            "sentiment": sent_info,
+            "macro": macro_info,
+        },
         "ml_prob_up": round(prob_up * 100, 1),
         "blended_prob_up": round(blended_prob * 100, 1),
         "test_accuracy": round(test_acc * 100, 1),
@@ -793,15 +1107,17 @@ def run_backtest(market: str, raw_symbol: str, target_days=3, leverage=None):
             prev_price = float(feat_df.iloc[idx - 1]["Close"]) if idx >= 1 else last_price
             atr_val = float(row["atr14"]) if pd.notna(row["atr14"]) and row["atr14"] > 0 else last_price * 0.01
             rsi_now = float(row["rsi14"]) if pd.notna(row["rsi14"]) else 50.0
+            ma10_now = float(row["ma10"]) if pd.notna(row["ma10"]) else last_price
             ma20_now = float(row["ma20"]) if pd.notna(row["ma20"]) else last_price
             ma60_now = float(row["ma60"]) if pd.notna(row["ma60"]) else last_price
+            lw_ratio = float(row["lower_wick_ratio"]) if pd.notna(row["lower_wick_ratio"]) else 0.0
 
             win_slice = feat_df.iloc[max(0, idx - 19): idx + 1]
             high_20 = float(win_slice["High"].max())
             low_20 = float(win_slice["Low"].min())
             range_pos_pct = float(np.clip((last_price - low_20) / max(high_20 - low_20, 1e-8) * 100.0, 0.0, 100.0))
 
-            direction, _, entry_price, stop_loss, take_profit, _, _ = _decide_signal(
+            direction, _, entry_price, stop_loss, take_profit, _, _, _ = _decide_signal(
                 profile=profile,
                 prob_up=prob_up,
                 blended_prob=blended_prob,
@@ -813,10 +1129,12 @@ def run_backtest(market: str, raw_symbol: str, target_days=3, leverage=None):
                 rsi_now=rsi_now,
                 range_pos_pct=range_pos_pct,
                 low_20=low_20,
+                ma10_now=ma10_now,
                 ma20_now=ma20_now,
                 ma60_now=ma60_now,
                 lev_val=lev_val,
                 is_intraday_scalp=is_intraday_scalp,
+                lower_wick_ratio=lw_ratio,
             )
 
             if direction not in ("偏多看漲", "偏空看跌"):
@@ -983,7 +1301,7 @@ def api_recommend():
             "market": market,
             "target_days": f"{max(0.05, min(days, 15.0)):g}",
             "checked_at": datetime.now(ZoneInfo("Asia/Taipei")).strftime("%Y-%m-%d %H:%M:%S"),
-            "criteria": "方向機率 ≥64%（或 ≤36% 且不追低空）＋ 驗證準確 ≥56% ＋ 盈虧比 ≥1.5 ＋ 新聞不打架",
+            "criteria": "方向機率 ≥65%（或 ≤35% 且防軋空/高槓桿保護）＋ 驗證準確 ≥56% ＋ 盈虧比 ≥1.5 ＋ 四維與新聞不打架",
             "recommendations": recs,
         })
     except Exception as exc:
