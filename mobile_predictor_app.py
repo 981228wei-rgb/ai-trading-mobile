@@ -92,7 +92,7 @@ TRACK_PROFILES = {
         "allow_short": True,
     },
     "加密貨幣_極短線": {
-        "track_name": "加密貨幣短線合約軌（預測天數 < 1天・防軋空緊控損）",
+        "track_name": "加密貨幣短線合約軌（預測天數 < 1天・防插針/二次下探/軋空）",
         "bull_threshold": 0.60,
         "bear_threshold": 0.39,
         "entry_atr_mult": 0.22,
@@ -156,7 +156,7 @@ TRACK_PROFILES = {
         "allow_short": False,
     },
     "台股_短線": {
-        "track_name": "台股短線顺勢軌（僅做多・不做空單・嚴控回測與跳空風險）",
+        "track_name": "台股短線順勢軌（僅做多・不做空單・嚴控回測與跳空風險）",
         "bull_threshold": 0.57,
         "bear_threshold": 0.43,
         "entry_atr_mult": 0.24,
@@ -248,10 +248,19 @@ def analyze_price_structure(df: pd.DataFrame, last_price: float, range_label: st
     upper_wick_ratio = round(float(upper_wick / total_range), 3)
     lower_wick_ratio = round(float(lower_wick / total_range), 3)
 
+    # 統計近期 K 線是否上下插針頻繁、容易出現二次下探
+    recent_ranges = (recent["High"] - recent["Low"]).replace(0, np.nan)
+    recent_upper = (recent["High"] - np.maximum(recent["Open"], recent["Close"])) / recent_ranges
+    recent_lower = (np.minimum(recent["Open"], recent["Close"]) - recent["Low"]) / recent_ranges
+    wicky_bars = int(((recent_upper.fillna(0) >= 0.35) & (recent_lower.fillna(0) >= 0.25)).sum() + (recent_lower.fillna(0) >= 0.45).sum())
+    two_way_wick_chop = wicky_bars >= 4
+
     if lower_wick >= total_range * 0.45 and lower_wick > upper_wick * 1.5:
-        candle_signal = "長下影線（下檔有承接/防插針）"
+        candle_signal = "長下影線（下檔有承接/留意二次下探確認）"
     elif upper_wick >= total_range * 0.45 and upper_wick > lower_wick * 1.5:
         candle_signal = "長上影線（上方有賣壓/防追高）"
+    elif two_way_wick_chop:
+        candle_signal = "上下插針震盪（防二次下探與雙向洗盤）"
     elif body >= total_range * 0.65:
         candle_signal = "強勢長紅K（多方動能明確）" if close_p >= open_p else "強勢長黑K（空方賣壓宣洩）"
     else:
@@ -282,6 +291,7 @@ def analyze_price_structure(df: pd.DataFrame, last_price: float, range_label: st
         "range_pos_pct": pos_in_range,
         "upper_wick_ratio": upper_wick_ratio,
         "lower_wick_ratio": lower_wick_ratio,
+        "two_way_wick_chop": two_way_wick_chop,
         "range_label": range_label,
         "summary": f"{ma_structure}｜{candle_signal}｜{range_label}區間 {pos_in_range}%",
     }
@@ -290,9 +300,9 @@ def analyze_price_structure(df: pd.DataFrame, last_price: float, range_label: st
 def fetch_chip_and_flow_context(market: str, symbol: str, df: pd.DataFrame, macro_info: dict, news_score: float) -> dict:
     """
     第五維／籌碼與市場結構面：
-    - 台股：整合外資／投信／三大法人與融資借券氛圍、量價結構、大盤連動（TWII）與限空流動性環境
+    - 加密貨幣：整合量能、被動吸籌／流動性枯竭與資金流出警訊（資金流出時反彈遇壓易回落、下檔有買單牆則易震盪/二探）
     - 美股：整合機構風險偏好／去槓桿與擴散環境、量能結構、SPY 市場廣度代理指標
-    - 加密貨幣：整合槓桿波動與量價結構
+    - 台股：整合外資／投信／三大法人與融資借券氛圍、量價結構、大盤連動（TWII）與限空流動性環境
     """
     vol_ratio_now = float(df["vol_ratio"].iloc[-1]) if "vol_ratio" in df.columns and pd.notna(df["vol_ratio"].iloc[-1]) else 1.0
     ret_5d_now = float(df["ret_5d"].iloc[-1]) if "ret_5d" in df.columns and pd.notna(df["ret_5d"].iloc[-1]) else 0.0
@@ -370,20 +380,22 @@ def fetch_chip_and_flow_context(market: str, symbol: str, df: pd.DataFrame, macr
             "short_allowed": True,
         }
 
-    # 加密貨幣市場結構與量能
+    # 加密貨幣：融入被動吸籌／流動性枯竭與資金流出偏弱判讀
     score = 0.0
     notes = []
+    outflow_or_weak_flow = (vol_ratio_now < 0.90 and ret_5d_now < 0) or (vol_ratio_now >= 1.45 and ret_5d_now < -0.02)
+
     if vol_ratio_now >= 1.45 and ret_5d_now > 0.02:
         score += 0.20
-        notes.append(f"成交量放大 ({vol_ratio_now:.2f}x) 動能推升")
-    elif vol_ratio_now >= 1.45 and ret_5d_now < -0.02:
+        notes.append(f"放量推升 ({vol_ratio_now:.2f}x) 主動買盤回流")
+    elif outflow_or_weak_flow:
         score -= 0.20
-        notes.append(f"放量下殺 ({vol_ratio_now:.2f}x) 留意清算與洗盤")
+        notes.append(f"量能/資金面偏弱（量比 {vol_ratio_now:.2f}x）反彈遇壓易回落、留意下方買單承接與二次下探")
     else:
-        notes.append(f"量能比 {vol_ratio_now:.2f}x")
+        notes.append(f"量比 {vol_ratio_now:.2f}x｜低流動性區間易震盪吸籌")
 
     score = float(np.clip(score, -1.0, 1.0))
-    status = "量能動能偏多" if score >= 0.20 else ("洗盤/清算壓力偏高" if score <= -0.20 else "量能結構中性")
+    status = "主動買盤偏多" if score >= 0.20 else ("資金偏弱/被動吸籌防二探" if score <= -0.15 else "低流動性震盪吸籌")
     return {
         "score": round(score, 3),
         "status": status,
@@ -403,6 +415,7 @@ def build_entry_triggers(
     rsi_now: float,
     range_pos_pct: float,
     allow_short: bool,
+    two_way_wick_chop: bool = False,
 ) -> dict:
     """不管長線或短線，都直接給出開多、開空（台股明確不做空）與觀望的具體訊號條件。"""
     short_mode = is_short_term_contract(target_days)
@@ -426,21 +439,23 @@ def build_entry_triggers(
             "wait_signal": wait_signal,
         }
 
+    chop_note = "（目前上下插針較多，務必等二次下探止跌或收線確認再動手）" if two_way_wick_chop else ""
+
     if short_mode:
         long_signal = (
             f"回測支撐（如 {ma20_now:.4f} 或 {low_20:.4f} 附近）守穩不破，出現下影線收回或止跌 K 線收線，"
-            f"且 RSI 由低檔回升（避免追在急拉長上影線），再考慮開多單。"
+            f"且 RSI 由低檔回升（避免追在急拉長上影線），再考慮開多單{chop_note}。"
         )
         short_signal = (
             f"跌破 {ma20_now:.4f} 或關鍵支撐且 K 線實體收在下方、反彈測壓不過，或衝高至 {high_20:.4f} 附近出現長上影線與漲勢停滯，"
-            f"且未處於均線多頭排列與下檔強承接時，再考慮開空單。"
+            f"且未處於均線多頭排列與下檔強承接時，再考慮開空單{chop_note}。"
         )
         wait_signal = (
-            f"價格卡在 {low_20:.4f} ～ {high_20:.4f} 中間震盪、量縮或大 K 線尚未收線時先別開單，等條件到位再出手。"
+            f"價格卡在 {low_20:.4f} ～ {high_20:.4f} 中間震盪、上下插針未收線或資金動能不足時先別開單，等條件到位再出手。"
         )
     else:
         long_signal = (
-            f"趨勢結構站穩 {ma20_now:.4f} 上方，或回踩 {ma20_now:.4f}／{ma60_now:.4f} 支撐區止跌收紅、"
+            f"趨勢結構站穩 {ma20_now:.4f} 上方，或回踩 {ma20_now:.4f}／{ma60_now:.4f} 支撐區止跌收紅（留意二次下探是否守穩）、"
             f"估值與區間位置不過熱（目前 {range_pos_pct:.1f}%，RSI {rsi_now:.1f}），再分批偏多布局。"
         )
         short_signal = (
@@ -918,7 +933,6 @@ def _evaluate_time_series_cv(X: pd.DataFrame, y: pd.Series) -> float:
 
 
 def _compute_composite_score(market: str, tech_score: float, fund_score: float, sent_score: float, macro_score: float, flow_score: float) -> float:
-    """台股、美股、加密貨幣各自採用不同的全維度加權。"""
     if market == "台股":
         raw = (
             tech_score * 0.25
@@ -965,6 +979,7 @@ def _decide_signal(
     lev_val: float,
     is_short_contract_mode: bool,
     lower_wick_ratio: float = 0.0,
+    two_way_wick_chop: bool = False,
     tech_score: float = 0.0,
     fund_score: float = 0.0,
     sent_score: float = 0.0,
@@ -988,7 +1003,7 @@ def _decide_signal(
     uptrend_ma_stack = (last_price > ma20_now) and (ma20_now > ma60_now)
     broken_downtrend_structure = (last_price < ma20_now) and (ma20_now < ma60_now)
     sweep_and_reclaim = (range_pos_pct <= 15.0) and (last_price > low_20) and (chg_pct > -0.3)
-    spike_fade_risk = (chg_pct >= (2.2 if is_short_contract_mode else 3.8)) and (range_pos_pct >= 65.0 or rsi_now >= 68.0)
+    spike_fade_risk = (chg_pct >= (2.2 if is_short_contract_mode else 3.8)) and (range_pos_pct >= 65.0 or rsi_now >= 68.0 or flow_score <= -0.15)
     spike_whipsaw = (abs(chg_pct) >= (2.0 if is_short_contract_mode else 4.0)) and (atr_pct_now >= profile["extreme_atr_pct"] * 0.72)
 
     short_squeeze_or_bounce_risk = (
@@ -996,6 +1011,7 @@ def _decide_signal(
         or range_pos_pct <= 28.0
         or rsi_now <= 38.0
         or lower_wick_ratio >= 0.35
+        or two_way_wick_chop
         or (last_price >= ma10_now and chg_pct > 0.25)
         or chg_pct >= (1.5 if is_short_contract_mode else 4.5)
     )
@@ -1036,14 +1052,14 @@ def _decide_signal(
         stop_loss = round(entry_price - stop_mult * atr_val, 4) if (chg_pct < 0 or not allow_short) else round(entry_price + stop_mult * atr_val, 4)
         take_profit = round(entry_price + tp_mult * atr_val, 4) if (chg_pct < 0 or not allow_short) else round(entry_price - tp_mult * atr_val, 4)
         rr_ratio = round(tp_mult / max(stop_mult, 1e-8), 2)
-        action = f"短線急動易有第一根假針，不追單，等K線收穩再看 {entry_price} 附近"
+        action = f"短線急動易有第一根假針與二次測試，不追單，等K線收穩再看 {entry_price} 附近"
     elif spike_fade_risk and blended_prob >= profile["bull_threshold"]:
         direction = "急拉防回落與二探"
         entry_price = round(last_price - max(entry_mult * 1.35, 0.35) * atr_val, 4)
         stop_loss = round(entry_price - stop_mult * atr_val, 4)
         take_profit = round(entry_price + tp_mult * atr_val, 4)
         rr_ratio = round(max(take_profit - entry_price, 0.0) / max(entry_price - stop_loss, 1e-8), 2)
-        action = f"短線急拉後留意阻力回落與二探，不盲目追高，等回測/二探守穩 {entry_price} 再看"
+        action = f"短線急拉或資金動能不足後留意阻力回落與二探，不盲目追高，等回測/二探守穩 {entry_price} 再看"
     elif blended_prob >= profile["bull_threshold"] and macro_headwind_block_long:
         direction = "宏觀逆風留意回落"
         entry_price = round(last_price - max(entry_mult * 1.4, 0.35) * atr_val, 4)
@@ -1057,10 +1073,13 @@ def _decide_signal(
         stop_loss = round(entry_price - stop_mult * atr_val, 4)
         take_profit = round(entry_price + tp_mult * atr_val, 4)
         rr_ratio = round(max(take_profit - entry_price, 0.0) / max(entry_price - stop_loss, 1e-8), 2)
-        action = f"接近區間高檔阻力但動能未加速，防假突破，等回測 {entry_price} 再評估"
+        action = f"接近區間高檔阻力但動能未加速，防假突破與回落二探，等回測 {entry_price} 再評估"
     elif blended_prob >= profile["bull_threshold"]:
         direction = "偏多看漲"
-        if broken_downtrend_structure and not is_bottom_zone:
+        if two_way_wick_chop:
+            entry_price = round(last_price - max(entry_mult * 1.2, 0.30) * atr_val, 4)
+            entry_hint = f"上下插針震盪中，防二次下探掃單，等回測支撐守穩 {entry_price} 再評估偏多"
+        elif broken_downtrend_structure and not is_bottom_zone:
             entry_price = round(last_price - max(entry_mult * 1.4, 0.35) * atr_val, 4)
             entry_hint = f"空頭結構未完全修復，反彈不盲目戀戰，等回測/二探 {entry_price}"
         elif is_bottom_zone or (range_pos_pct <= 18.0 and rsi_now <= 32.0):
@@ -1074,7 +1093,6 @@ def _decide_signal(
         rr_ratio = round(max(take_profit - entry_price, 0.0) / max(entry_price - stop_loss, 1e-8), 2)
         action = f"{entry_hint}（停損 {stop_mult:.2f} ATR / 停利 {tp_mult:.2f} ATR，盈虧比 1:{rr_ratio}）"
     elif blended_prob <= profile["bear_threshold"] and not allow_short:
-        # 台股不做空單：空方訊號一律轉為觀望／等支撐止跌
         direction = "台股不做空（觀望等支撐）"
         entry_price = round(last_price - max(entry_mult * 1.35, 0.35) * atr_val, 4)
         stop_loss = round(entry_price - stop_mult * atr_val, 4)
@@ -1094,23 +1112,25 @@ def _decide_signal(
         rr_ratio = round(max(entry_price - take_profit, 0.0) / max(stop_loss - entry_price, 1e-8), 2)
         action = f"{entry_hint}（停損 {stop_mult:.2f} ATR / 停利 {tp_mult:.2f} ATR，盈虧比 1:{rr_ratio}）"
     elif blended_prob <= profile["bear_threshold"] and allow_short and short_squeeze_or_bounce_risk:
-        direction = "防反彈軋空（不追空）"
+        direction = "防反彈軋空與二探（不追空）"
         entry_price = round(last_price + max(entry_mult * 1.35, 0.45) * atr_val, 4)
         stop_loss = round(entry_price + stop_mult * atr_val, 4)
         take_profit = round(entry_price - tp_mult * atr_val, 4)
         rr_ratio = round(max(entry_price - take_profit, 0.0) / max(stop_loss - entry_price, 1e-8), 2)
         if uptrend_ma_stack:
-            action = f"均線仍呈多頭排列且有下影線承接，目前不建議直接開空；若要等空，需等反彈受阻至 {entry_price} 附近且轉弱再評估"
+            action = f"均線仍呈多頭排列且下檔有買單/下影線承接，目前不建議直接開空；若要等空，需等反彈受阻至 {entry_price} 附近且轉弱再評估"
+        elif two_way_wick_chop:
+            action = f"上下插針頻繁、下檔有買單承接，容易反彈或二探洗盤，不盲目追空；若反彈至 {entry_price} 受阻再看"
         else:
             action = f"短線易有反彈或下影線承接，不盲目追空；若等反彈至 {entry_price} 受阻再看（盈虧比 1:{rr_ratio}）"
     else:
-        direction = "震盪中性"
+        direction = "震盪吸籌／防二探" if two_way_wick_chop else "震盪中性"
         entry_price = round(last_price, 4) if is_bottom_zone else round(last_price - max(entry_mult, 0.25) * atr_val, 4)
         stop_loss = round(entry_price - stop_mult * atr_val, 4)
         take_profit = round(entry_price + tp_mult * atr_val, 4)
         rr_ratio = round(tp_mult / max(stop_mult, 1e-8), 2)
         no_short_note = "（台股不做空）" if not allow_short else ""
-        action = f"全維度綜合 {composite_score:+.2f}{no_short_note}（區間磨底/上下洗盤，控管槓桿與倉位），參考點位 {entry_price}（盈虧比 1:{rr_ratio}）"
+        action = f"全維度綜合 {composite_score:+.2f}{no_short_note}（低流動性或上下插針區間易震盪/二探，控管槓桿與倉位），參考點位 {entry_price}（盈虧比 1:{rr_ratio}）"
 
     return direction, action, entry_price, stop_loss, take_profit, rr_ratio, chg_pct, composite_score
 
@@ -1233,6 +1253,7 @@ def run_prediction(market: str, raw_symbol: str, target_days=3, leverage=None, c
         lev_val=lev_val,
         is_short_contract_mode=short_mode,
         lower_wick_ratio=structure_info["lower_wick_ratio"],
+        two_way_wick_chop=structure_info["two_way_wick_chop"],
         tech_score=tech_info["score"],
         fund_score=fund_info["score"],
         sent_score=sent_info["score"],
@@ -1253,6 +1274,7 @@ def run_prediction(market: str, raw_symbol: str, target_days=3, leverage=None, c
         rsi_now=rsi_now,
         range_pos_pct=structure_info["range_pos_pct"],
         allow_short=allow_short,
+        two_way_wick_chop=structure_info["two_way_wick_chop"],
     )
 
     exit_alert = build_exit_alert(
