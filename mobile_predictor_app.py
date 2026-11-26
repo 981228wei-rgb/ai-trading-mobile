@@ -179,6 +179,7 @@ def analyze_price_structure(df: pd.DataFrame, last_price: float, range_label: st
     body = abs(close_p - open_p)
     upper_wick = max(high_p - max(open_p, close_p), 0.0)
     lower_wick = max(min(open_p, close_p) - low_p, 0.0)
+    upper_wick_ratio = round(float(upper_wick / total_range), 3)
     lower_wick_ratio = round(float(lower_wick / total_range), 3)
 
     if lower_wick >= total_range * 0.45 and lower_wick > upper_wick * 1.5:
@@ -213,9 +214,43 @@ def analyze_price_structure(df: pd.DataFrame, last_price: float, range_label: st
         "high_20": round(high_20, 4),
         "low_20": round(low_20, 4),
         "range_pos_pct": pos_in_range,
+        "upper_wick_ratio": upper_wick_ratio,
         "lower_wick_ratio": lower_wick_ratio,
         "range_label": range_label,
         "summary": f"{ma_structure}｜{candle_signal}｜{range_label}區間 {pos_in_range}%",
+    }
+
+
+def build_exit_alert(
+    chg_pct: float,
+    rsi_now: float,
+    range_pos_pct: float,
+    upper_wick_ratio: float,
+    lower_wick_ratio: float,
+    is_intraday_scalp: bool,
+    take_profit: float,
+    last_price: float,
+) -> dict:
+    spike_thresh = 1.8 if is_intraday_scalp else 3.5
+    if (
+        (range_pos_pct >= 78.0 and (upper_wick_ratio >= 0.35 or rsi_now >= 70.0))
+        or (chg_pct >= spike_thresh and upper_wick_ratio >= 0.30)
+    ):
+        return {
+            "level": "high",
+            "title": "多單留意分批止盈／上移停利",
+            "reason": f"處於區間高檔或急拉後出現上影線賣壓（區間 {range_pos_pct:.1f}%、上影線 {upper_wick_ratio*100:.0f}%、RSI {rsi_now:.1f}），漲勢若停滯建議先減碼鎖利，目標參考 {take_profit}。",
+        }
+    if range_pos_pct <= 22.0 and (lower_wick_ratio >= 0.35 or rsi_now <= 32.0):
+        return {
+            "level": "medium",
+            "title": "空單留意回補止盈／防反彈",
+            "reason": f"靠近低檔支撐或下影線承接（區間 {range_pos_pct:.1f}%、下影線 {lower_wick_ratio*100:.0f}%、RSI {rsi_now:.1f}），若跌勢放緩建議分批回補空單。",
+        }
+    return {
+        "level": "normal",
+        "title": "尚未觸發急轉止盈警戒",
+        "reason": f"目前區間位置 {range_pos_pct:.1f}%、RSI {rsi_now:.1f}，請持續對照停損／停利與實際盤面量價變化。",
     }
 
 
@@ -678,7 +713,6 @@ def _decide_signal(
     spike_fade_risk = (chg_pct >= (2.2 if is_intraday_scalp else 3.8)) and (range_pos_pct >= 65.0 or rsi_now >= 68.0)
     spike_whipsaw = (abs(chg_pct) >= (2.0 if is_intraday_scalp else 4.0)) and (atr_pct_now >= profile["extreme_atr_pct"] * 0.72)
 
-    # 防軋空/防反彈濾網：低位、下影線有承接或短線剛起漲（站上 MA10 且正動能）時不追空
     short_squeeze_or_bounce_risk = (
         range_pos_pct <= 28.0
         or rsi_now <= 38.0
@@ -922,8 +956,19 @@ def run_prediction(market: str, raw_symbol: str, target_days=3, leverage=None, c
         macro_risk_off=macro_info["risk_off"],
     )
 
+    exit_alert = build_exit_alert(
+        chg_pct=chg_1d_pct,
+        rsi_now=rsi_now,
+        range_pos_pct=structure_info["range_pos_pct"],
+        upper_wick_ratio=structure_info["upper_wick_ratio"],
+        lower_wick_ratio=structure_info["lower_wick_ratio"],
+        is_intraday_scalp=is_intraday_scalp,
+        take_profit=take_profit,
+        last_price=last_price,
+    )
+
     news_score_val = news_info["score"]
-    high_lev_short_blocked = (direction == "偏空看跌") and (lev_val >= 10.0) and (chg_pct > -0.35 or structure_info["lower_wick_ratio"] >= 0.25)
+    high_lev_short_blocked = (direction == "偏空看跌") and (lev_val >= 10.0) and (chg_1d_pct > -0.35 or structure_info["lower_wick_ratio"] >= 0.25)
     news_aligned_bull = (blended_prob >= 0.65) and (news_score_val >= -0.10) and (prob_up >= 0.60) and (four_dim_score >= 0.12)
     news_aligned_bear = (
         (direction == "偏空看跌")
@@ -972,6 +1017,7 @@ def run_prediction(market: str, raw_symbol: str, target_days=3, leverage=None, c
         "chg_1d_pct": round(chg_1d_pct, 2),
         "direction": direction,
         "action": action,
+        "exit_alert": exit_alert,
         "entry_price": entry_price,
         "rr_ratio": rr_ratio,
         "win_prob_display": win_prob_display,
