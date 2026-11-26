@@ -415,11 +415,17 @@ def _decide_signal(
     rsi_now: float,
     range_pos_pct: float,
     low_20: float,
+    ma20_now: float,
+    ma60_now: float,
     lev_val: float,
     is_intraday_scalp: bool,
 ):
     chg_pct = ((last_price - prev_price) / prev_price * 100.0) if prev_price else 0.0
     atr_pct_now = atr_val / max(last_price, 1e-8)
+
+    # 結構與假跌破/二次測試判斷（參考大級別結構與插針收回邏輯）
+    broken_downtrend_structure = (last_price < ma20_now) and (ma20_now < ma60_now)
+    sweep_and_reclaim = (range_pos_pct <= 15.0) and (last_price > low_20) and (chg_pct > -0.3)
 
     extreme_high_risk = (
         atr_pct_now >= profile["extreme_atr_pct"]
@@ -454,7 +460,7 @@ def _decide_signal(
         stop_loss = round(entry_price - stop_mult * atr_val, 4)
         take_profit = round(entry_price + tp_mult * atr_val, 4)
         rr_ratio = round(tp_mult / max(stop_mult, 1e-8), 2)
-        action = "波動/槓桿風險過高，易出現假突破與插針，建議先觀望" if extreme_high_risk else "訊號處於五五波與多空拉鋸，建議先不做單"
+        action = "波動/槓桿風險過高，易出現插針與掃單，建議先觀望" if extreme_high_risk else "訊號處於五五波與多空拉鋸，建議先不做單"
     elif blended_prob >= profile["bull_threshold"] and near_resistance_stall:
         direction = "高檔阻力留意回落"
         entry_price = round(last_price - max(entry_mult * 1.25, 0.30) * atr_val, 4)
@@ -466,9 +472,12 @@ def _decide_signal(
         action = f"接近區間高檔阻力但動能未加速，防假突破，等回測 {entry_price} 再評估"
     elif blended_prob >= profile["bull_threshold"]:
         direction = "偏多看漲"
-        if is_bottom_zone or (range_pos_pct <= 18.0 and rsi_now <= 32.0):
+        if broken_downtrend_structure and not is_bottom_zone:
+            entry_price = round(last_price - max(entry_mult * 1.4, 0.35) * atr_val, 4)
+            entry_hint = f"空頭結構未完全修復，不急追高，等回測/二次測試 {entry_price} 再評估"
+        elif is_bottom_zone or (range_pos_pct <= 18.0 and rsi_now <= 32.0):
             entry_price = round(last_price, 4)
-            entry_hint = f"處於低檔止跌區，可評估現價 {entry_price} 附近進場"
+            entry_hint = "下探收回有承接跡象，可評估現價 " + f"{entry_price} 附近進場" if sweep_and_reclaim else f"處於低檔止跌區，可評估現價 {entry_price} 附近進場"
         else:
             entry_price = round(last_price - max(entry_mult, 0.25) * atr_val, 4)
             entry_hint = f"順勢偏多，防衝高假突破，建議等回測 {entry_price} 附近掛單"
@@ -494,15 +503,18 @@ def _decide_signal(
         action = f"{entry_hint}（停損 {stop_mult:.2f} ATR / 停利 {tp_mult:.2f} ATR，盈虧比 1:{rr_ratio}）"
     elif blended_prob <= profile["bear_threshold"] and low_zone_no_short:
         direction = "低點防反彈（不追空）"
-        if is_bottom_zone:
+        if is_bottom_zone and sweep_and_reclaim:
             entry_price = round(last_price, 4)
-            entry_hint = f"已貼近極端低位/超賣區，若要接反彈可看現價 {entry_price} 附近"
+            entry_hint = f"下探收回並現二次測試承接，若要接反彈可看現價 {entry_price} 附近"
+        elif is_bottom_zone:
+            entry_price = round(last_price, 4)
+            entry_hint = f"已貼近極端低位/超賣區，若要接反彈可看現價 {entry_price} 附近（控管風險）"
         else:
             support_pullback = max(entry_mult * 1.35, 0.45) * atr_val
             entry_price = round(max(low_20, last_price - support_pullback), 4)
             if entry_price >= last_price:
                 entry_price = round(last_price - support_pullback, 4)
-            entry_hint = f"不逆勢盲目抄底也不追空，若要接反彈等 {entry_price} 支撐區"
+            entry_hint = f"結構偏弱不盲目接刀也不追空，等 {entry_price} 支撐二次測試"
         min_buf = max(stop_mult * atr_val, entry_price * profile["min_stop_pct"])
         raw_stop = min(entry_price - min_buf, low_20 - 0.25 * atr_val)
         stop_loss = round(max(raw_stop, entry_price - max(stop_mult * 1.25, 1.0) * atr_val), 4)
@@ -519,7 +531,7 @@ def _decide_signal(
         stop_loss = round(entry_price - stop_mult * atr_val, 4)
         take_profit = round(entry_price + tp_mult * atr_val, 4)
         rr_ratio = round(tp_mult / max(stop_mult, 1e-8), 2)
-        action = f"震盪區間易有假動作，參考進場點 {entry_price}（盈虧比 1:{rr_ratio}）"
+        action = f"盤整區間易有插針洗盤，等區間方向明朗，參考點位 {entry_price}（盈虧比 1:{rr_ratio}）"
 
     return direction, action, entry_price, stop_loss, take_profit, rr_ratio, chg_pct
 
@@ -605,6 +617,8 @@ def run_prediction(market: str, raw_symbol: str, target_days=3, leverage=None, c
         rsi_now=rsi_now,
         range_pos_pct=structure_info["range_pos_pct"],
         low_20=structure_info["low_20"],
+        ma20_now=ma20_now,
+        ma60_now=ma60_now,
         lev_val=lev_val,
         is_intraday_scalp=is_intraday_scalp,
     )
@@ -779,6 +793,8 @@ def run_backtest(market: str, raw_symbol: str, target_days=3, leverage=None):
             prev_price = float(feat_df.iloc[idx - 1]["Close"]) if idx >= 1 else last_price
             atr_val = float(row["atr14"]) if pd.notna(row["atr14"]) and row["atr14"] > 0 else last_price * 0.01
             rsi_now = float(row["rsi14"]) if pd.notna(row["rsi14"]) else 50.0
+            ma20_now = float(row["ma20"]) if pd.notna(row["ma20"]) else last_price
+            ma60_now = float(row["ma60"]) if pd.notna(row["ma60"]) else last_price
 
             win_slice = feat_df.iloc[max(0, idx - 19): idx + 1]
             high_20 = float(win_slice["High"].max())
@@ -797,6 +813,8 @@ def run_backtest(market: str, raw_symbol: str, target_days=3, leverage=None):
                 rsi_now=rsi_now,
                 range_pos_pct=range_pos_pct,
                 low_20=low_20,
+                ma20_now=ma20_now,
+                ma60_now=ma60_now,
                 lev_val=lev_val,
                 is_intraday_scalp=is_intraday_scalp,
             )
