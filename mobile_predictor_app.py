@@ -1,5 +1,6 @@
 import os
 import json
+import time
 import xml.etree.ElementTree as ET
 from datetime import datetime
 from urllib.parse import quote
@@ -16,6 +17,10 @@ from sklearn.metrics import accuracy_score
 from sklearn.model_selection import TimeSeriesSplit
 
 app = Flask(__name__)
+
+# 短期訊號快取（防抖動）：同標的 180 秒內避免因微幅跳價頻繁翻臉
+_SIGNAL_CACHE = {}
+_SIGNAL_CACHE_TTL_SEC = 180
 
 POSITIVE_WORDS = [
     "beat", "beats", "surge", "surges", "soar", "soars", "rally", "bullish",
@@ -71,7 +76,7 @@ MARKET_PRESETS = {
 
 TRACK_PROFILES = {
     "加密貨幣": {
-        "track_name": "加密貨幣軌（四維濾網・結構控損）",
+        "track_name": "加密貨幣波段/長線軌（預測天數 ≥ 1天・四維濾網）",
         "bull_threshold": 0.58,
         "bear_threshold": 0.42,
         "entry_atr_mult": 0.35,
@@ -86,7 +91,7 @@ TRACK_PROFILES = {
         "fee_rate": 0.0005,
     },
     "加密貨幣_極短線": {
-        "track_name": "加密貨幣極短線軌（四維濾網・防軋空緊控損）",
+        "track_name": "加密貨幣短線合約軌（預測天數 < 1天・防軋空緊控損）",
         "bull_threshold": 0.60,
         "bear_threshold": 0.39,
         "entry_atr_mult": 0.22,
@@ -101,7 +106,7 @@ TRACK_PROFILES = {
         "fee_rate": 0.0006,
     },
     "股票": {
-        "track_name": "股票軌（四維濾網・順均線與基本面）",
+        "track_name": "股票波段/長線軌（預測天數 ≥ 1天・順均線與基本面）",
         "bull_threshold": 0.55,
         "bear_threshold": 0.45,
         "entry_atr_mult": 0.30,
@@ -115,15 +120,34 @@ TRACK_PROFILES = {
         "extreme_move_pct": 10.0,
         "fee_rate": 0.0005,
     },
+    "股票_短線": {
+        "track_name": "股票短線軌（預測天數 < 1天・嚴控波動與停損）",
+        "bull_threshold": 0.57,
+        "bear_threshold": 0.43,
+        "entry_atr_mult": 0.24,
+        "stop_atr_mult": 0.95,
+        "tp_atr_mult": 1.75,
+        "target_ret_min": 0.002,
+        "max_risk_pct": 0.008,
+        "min_stop_pct": 0.005,
+        "extreme_atr_pct": 0.045,
+        "extreme_lev": 5.0,
+        "extreme_move_pct": 7.0,
+        "fee_rate": 0.0005,
+    },
 }
 
 
+def is_short_term_contract(target_days: float) -> bool:
+    """預測天數小於 1 天才視為短線合約；1 天以上歸類為長線／波段。"""
+    return float(target_days) < 1.0
+
+
 def get_track_profile(market: str, target_days: float) -> dict:
+    short_mode = is_short_term_contract(target_days)
     if market == "加密貨幣":
-        if target_days < 1.0:
-            return TRACK_PROFILES["加密貨幣_極短線"]
-        return TRACK_PROFILES["加密貨幣"]
-    return TRACK_PROFILES["股票"]
+        return TRACK_PROFILES["加密貨幣_極短線"] if short_mode else TRACK_PROFILES["加密貨幣"]
+    return TRACK_PROFILES["股票_短線"] if short_mode else TRACK_PROFILES["股票"]
 
 
 def normalize_symbol(market: str, raw_symbol: str) -> str:
@@ -221,17 +245,65 @@ def analyze_price_structure(df: pd.DataFrame, last_price: float, range_label: st
     }
 
 
+def build_entry_triggers(
+    target_days: float,
+    last_price: float,
+    ma20_now: float,
+    ma60_now: float,
+    high_20: float,
+    low_20: float,
+    rsi_now: float,
+    range_pos_pct: float,
+) -> dict:
+    """不管長線或短線，都直接給出開多、開空與觀望的具體訊號條件。"""
+    short_mode = is_short_term_contract(target_days)
+    mode_label = "短線合約（< 1天）" if short_mode else "波段／長線（≥ 1天）"
+
+    if short_mode:
+        long_signal = (
+            f"回測支撐（如 {ma20_now:.4f} 或 {low_20:.4f} 附近）守穩不破，出現下影線收回或止跌 K 線收線，"
+            f"且 RSI 由低檔回升（避免追在急拉長上影線），再考慮開多單。"
+        )
+        short_signal = (
+            f"跌破 {ma20_now:.4f} 或關鍵支撐且 K 線實體收在下方、反彈測壓不過，或衝高至 {high_20:.4f} 附近出現長上影線與漲勢停滯，"
+            f"且未處於均線多頭排列與下檔強承接時，再考慮開空單。"
+        )
+        wait_signal = (
+            f"價格卡在 {low_20:.4f} ～ {high_20:.4f} 中間震盪、量縮或大 K 線尚未收線時先別開單，等條件到位再出手。"
+        )
+    else:
+        long_signal = (
+            f"日線結構站穩 {ma20_now:.4f} 上方，或回踩 {ma20_now:.4f}／{ma60_now:.4f} 趨勢支撐區止跌收紅、"
+            f"區間位置不過熱（目前 {range_pos_pct:.1f}%，RSI {rsi_now:.1f}），再分批偏多布局。"
+        )
+        short_signal = (
+            f"日線跌破 {ma20_now:.4f} 且反彈受阻轉弱，或靠近 {high_20:.4f} 阻力區出現明顯上影線／動能背離且跌勢確認，"
+            f"不逆勢硬空底部或強勢多頭排列，再考慮偏空操作。"
+        )
+        wait_signal = (
+            f"均線糾結或處於 {low_20:.4f} ～ {high_20:.4f} 區間中段無明確突破／跌破收盤時，先等方向表態再出手。"
+        )
+
+    return {
+        "is_short_contract": short_mode,
+        "horizon_category": mode_label,
+        "long_signal": long_signal,
+        "short_signal": short_signal,
+        "wait_signal": wait_signal,
+    }
+
+
 def build_exit_alert(
     chg_pct: float,
     rsi_now: float,
     range_pos_pct: float,
     upper_wick_ratio: float,
     lower_wick_ratio: float,
-    is_intraday_scalp: bool,
+    is_short_contract_mode: bool,
     take_profit: float,
     last_price: float,
 ) -> dict:
-    spike_thresh = 1.8 if is_intraday_scalp else 3.5
+    spike_thresh = 1.8 if is_short_contract_mode else 3.5
     if (
         (range_pos_pct >= 78.0 and (upper_wick_ratio >= 0.35 or rsi_now >= 70.0))
         or (chg_pct >= spike_thresh and upper_wick_ratio >= 0.30)
@@ -692,7 +764,7 @@ def _decide_signal(
     ma20_now: float,
     ma60_now: float,
     lev_val: float,
-    is_intraday_scalp: bool,
+    is_short_contract_mode: bool,
     lower_wick_ratio: float = 0.0,
     tech_score: float = 0.0,
     fund_score: float = 0.0,
@@ -708,17 +780,19 @@ def _decide_signal(
         3,
     )
 
+    uptrend_ma_stack = (last_price > ma20_now) and (ma20_now > ma60_now)
     broken_downtrend_structure = (last_price < ma20_now) and (ma20_now < ma60_now)
     sweep_and_reclaim = (range_pos_pct <= 15.0) and (last_price > low_20) and (chg_pct > -0.3)
-    spike_fade_risk = (chg_pct >= (2.2 if is_intraday_scalp else 3.8)) and (range_pos_pct >= 65.0 or rsi_now >= 68.0)
-    spike_whipsaw = (abs(chg_pct) >= (2.0 if is_intraday_scalp else 4.0)) and (atr_pct_now >= profile["extreme_atr_pct"] * 0.72)
+    spike_fade_risk = (chg_pct >= (2.2 if is_short_contract_mode else 3.8)) and (range_pos_pct >= 65.0 or rsi_now >= 68.0)
+    spike_whipsaw = (abs(chg_pct) >= (2.0 if is_short_contract_mode else 4.0)) and (atr_pct_now >= profile["extreme_atr_pct"] * 0.72)
 
     short_squeeze_or_bounce_risk = (
-        range_pos_pct <= 28.0
+        uptrend_ma_stack
+        or range_pos_pct <= 28.0
         or rsi_now <= 38.0
         or lower_wick_ratio >= 0.35
         or (last_price >= ma10_now and chg_pct > 0.25)
-        or chg_pct >= (1.5 if is_intraday_scalp else 4.5)
+        or chg_pct >= (1.5 if is_short_contract_mode else 4.5)
     )
 
     extreme_high_risk = (
@@ -739,7 +813,7 @@ def _decide_signal(
 
     is_bottom_zone = (
         (range_pos_pct <= 8.0 and rsi_now <= 24.0)
-        if is_intraday_scalp
+        if is_short_contract_mode
         else ((range_pos_pct <= 12.0) or (rsi_now <= 25.0))
     )
     near_resistance_stall = (range_pos_pct >= 82.0 and chg_pct <= 0.4)
@@ -763,27 +837,21 @@ def _decide_signal(
         entry_price = round(last_price - max(entry_mult * 1.35, 0.35) * atr_val, 4)
         stop_loss = round(entry_price - stop_mult * atr_val, 4)
         take_profit = round(entry_price + tp_mult * atr_val, 4)
-        risk_per_unit = max(entry_price - stop_loss, 1e-8)
-        reward_per_unit = max(take_profit - entry_price, 0.0)
-        rr_ratio = round(reward_per_unit / risk_per_unit, 2)
+        rr_ratio = round(max(take_profit - entry_price, 0.0) / max(entry_price - stop_loss, 1e-8), 2)
         action = f"短線急拉後留意阻力回落與二探，不盲目追高，等回測/二探守穩 {entry_price} 再看"
     elif blended_prob >= profile["bull_threshold"] and macro_headwind_block_long:
         direction = "宏觀逆風留意回落"
         entry_price = round(last_price - max(entry_mult * 1.4, 0.35) * atr_val, 4)
         stop_loss = round(entry_price - stop_mult * atr_val, 4)
         take_profit = round(entry_price + tp_mult * atr_val, 4)
-        risk_per_unit = max(entry_price - stop_loss, 1e-8)
-        reward_per_unit = max(take_profit - entry_price, 0.0)
-        rr_ratio = round(reward_per_unit / risk_per_unit, 2)
+        rr_ratio = round(max(take_profit - entry_price, 0.0) / max(entry_price - stop_loss, 1e-8), 2)
         action = f"宏觀逆風/風險偏緊，反彈不戀戰，等回測 {entry_price} 再評估"
     elif blended_prob >= profile["bull_threshold"] and near_resistance_stall:
         direction = "高檔阻力留意回落"
         entry_price = round(last_price - max(entry_mult * 1.25, 0.30) * atr_val, 4)
         stop_loss = round(entry_price - stop_mult * atr_val, 4)
         take_profit = round(entry_price + tp_mult * atr_val, 4)
-        risk_per_unit = max(entry_price - stop_loss, 1e-8)
-        reward_per_unit = max(take_profit - entry_price, 0.0)
-        rr_ratio = round(reward_per_unit / risk_per_unit, 2)
+        rr_ratio = round(max(take_profit - entry_price, 0.0) / max(entry_price - stop_loss, 1e-8), 2)
         action = f"接近區間高檔阻力但動能未加速，防假突破，等回測 {entry_price} 再評估"
     elif blended_prob >= profile["bull_threshold"]:
         direction = "偏多看漲"
@@ -798,9 +866,7 @@ def _decide_signal(
             entry_hint = f"四維偏多（綜合 {four_dim_score:+.2f}），防衝高假突破，等回測 {entry_price} 掛單"
         stop_loss = round(entry_price - stop_mult * atr_val, 4)
         take_profit = round(entry_price + tp_mult * atr_val, 4)
-        risk_per_unit = max(entry_price - stop_loss, 1e-8)
-        reward_per_unit = max(take_profit - entry_price, 0.0)
-        rr_ratio = round(reward_per_unit / risk_per_unit, 2)
+        rr_ratio = round(max(take_profit - entry_price, 0.0) / max(entry_price - stop_loss, 1e-8), 2)
         action = f"{entry_hint}（停損 {stop_mult:.2f} ATR / 停利 {tp_mult:.2f} ATR，盈虧比 1:{rr_ratio}）"
     elif blended_prob <= profile["bear_threshold"] and not short_squeeze_or_bounce_risk:
         direction = "偏空看跌"
@@ -812,31 +878,18 @@ def _decide_signal(
             entry_hint = f"四維偏空（綜合 {four_dim_score:+.2f}），防短線反彈軋空，等反彈受阻至 {entry_price} 再評估"
         stop_loss = round(entry_price + stop_mult * atr_val, 4)
         take_profit = round(entry_price - tp_mult * atr_val, 4)
-        risk_per_unit = max(stop_loss - entry_price, 1e-8)
-        reward_per_unit = max(entry_price - take_profit, 0.0)
-        rr_ratio = round(reward_per_unit / risk_per_unit, 2)
+        rr_ratio = round(max(entry_price - take_profit, 0.0) / max(stop_loss - entry_price, 1e-8), 2)
         action = f"{entry_hint}（停損 {stop_mult:.2f} ATR / 停利 {tp_mult:.2f} ATR，盈虧比 1:{rr_ratio}）"
     elif blended_prob <= profile["bear_threshold"] and short_squeeze_or_bounce_risk:
         direction = "防反彈軋空（不追空）"
-        if is_bottom_zone and sweep_and_reclaim:
-            entry_price = round(last_price, 4)
-            entry_hint = f"下探收回出現止跌跡象，短線防反彈軋空，不追空，留意現價 {entry_price} 附近"
+        entry_price = round(last_price + max(entry_mult * 1.35, 0.45) * atr_val, 4)
+        stop_loss = round(entry_price + stop_mult * atr_val, 4)
+        take_profit = round(entry_price - tp_mult * atr_val, 4)
+        rr_ratio = round(max(entry_price - take_profit, 0.0) / max(stop_loss - entry_price, 1e-8), 2)
+        if uptrend_ma_stack:
+            action = f"均線仍呈多頭排列且有下影線承接，目前不建議直接開空；若要等空，需等反彈受阻至 {entry_price} 附近且轉弱再評估"
         else:
-            support_pullback = max(entry_mult * 1.35, 0.45) * atr_val
-            entry_price = round(max(low_20, last_price - support_pullback), 4)
-            if entry_price >= last_price:
-                entry_price = round(last_price - support_pullback, 4)
-            entry_hint = f"短線易有反彈或下影線承接，不盲目追空，等結構明朗或 {entry_price} 支撐確認"
-        min_buf = max(stop_mult * atr_val, entry_price * profile["min_stop_pct"])
-        raw_stop = min(entry_price - min_buf, low_20 - 0.25 * atr_val)
-        stop_loss = round(max(raw_stop, entry_price - max(stop_mult * 1.25, 1.0) * atr_val), 4)
-        if stop_loss >= entry_price:
-            stop_loss = round(entry_price - min_buf, 4)
-        take_profit = round(entry_price + tp_mult * atr_val, 4)
-        risk_per_unit = max(entry_price - stop_loss, 1e-8)
-        reward_per_unit = max(take_profit - entry_price, 0.0)
-        rr_ratio = round(reward_per_unit / risk_per_unit, 2)
-        action = f"{entry_hint}，防逆勢急拉打停損"
+            action = f"短線易有反彈或下影線承接，不盲目追空；若等反彈至 {entry_price} 受阻再看（盈虧比 1:{rr_ratio}）"
     else:
         direction = "震盪中性"
         entry_price = round(last_price, 4) if is_bottom_zone else round(last_price - max(entry_mult, 0.25) * atr_val, 4)
@@ -851,14 +904,28 @@ def _decide_signal(
 def run_prediction(market: str, raw_symbol: str, target_days=3, leverage=None, capital=None):
     raw_days = float(target_days if target_days is not None else 3)
     target_days = max(0.05, min(raw_days, 15.0))
+    short_mode = is_short_term_contract(target_days)
     profile = get_track_profile(market, target_days)
     symbol = normalize_symbol(market, raw_symbol)
+    lev_val = float(leverage) if (leverage is not None and leverage > 0) else 1.0
 
-    is_intraday_scalp = (market == "加密貨幣" and target_days < 1.0)
-    horizon_steps = max(2, int(round(target_days * 24))) if is_intraday_scalp else max(1, int(round(target_days)))
+    cache_key = (market, symbol, round(target_days, 4), round(lev_val, 2))
+    now_ts = time.time()
+    cached = _SIGNAL_CACHE.get(cache_key)
+    if cached and (now_ts - cached["ts"]) < _SIGNAL_CACHE_TTL_SEC:
+        res_copy = json.loads(json.dumps(cached["payload"]))
+        live_price = fetch_live_price(symbol)
+        if live_price is not None and live_price > 0:
+            res_copy["last_price"] = round(live_price, 4)
+        res_copy["updated_at"] = datetime.now(ZoneInfo("Asia/Taipei")).strftime("%Y-%m-%d %H:%M:%S")
+        res_copy["cache_note"] = "已啟用 3 分鐘防抖鎖定，避免短線微幅跳價造成訊號反覆"
+        return res_copy
+
+    use_intraday_bars = (market == "加密貨幣" and short_mode)
+    horizon_steps = max(2, int(round(target_days * 24))) if use_intraday_bars else max(1, int(round(target_days)))
 
     with ThreadPoolExecutor(max_workers=4) as pool:
-        hist_fut = pool.submit(fetch_history_df, symbol, is_intraday_scalp)
+        hist_fut = pool.submit(fetch_history_df, symbol, use_intraday_bars)
         news_fut = pool.submit(fetch_news_headlines, symbol, 8)
         live_fut = pool.submit(fetch_live_price, symbol)
         macro_fut = pool.submit(fetch_macro_context, market)
@@ -905,7 +972,7 @@ def run_prediction(market: str, raw_symbol: str, target_days=3, leverage=None, c
     prev_price = float(feat_df["Close"].iloc[-2]) if len(feat_df) >= 2 else last_price
     chg_1d_pct = ((last_price - prev_price) / prev_price * 100.0) if prev_price else 0.0
 
-    range_label = "20根1h" if is_intraday_scalp else "20日"
+    range_label = "20根1h" if use_intraday_bars else "20日"
     structure_info = analyze_price_structure(feat_df, last_price, range_label=range_label)
     rsi_now = float(feat_df["rsi14"].iloc[-1]) if pd.notna(feat_df["rsi14"].iloc[-1]) else 50.0
     ma10_now = float(feat_df["ma10"].iloc[-1]) if pd.notna(feat_df["ma10"].iloc[-1]) else last_price
@@ -929,7 +996,6 @@ def run_prediction(market: str, raw_symbol: str, target_days=3, leverage=None, c
     atr_val = float(feat_df["atr14"].iloc[-1]) if pd.notna(feat_df["atr14"].iloc[-1]) else last_price * 0.01
     vol_val = float(feat_df["vol_20"].iloc[-1]) if pd.notna(feat_df["vol_20"].iloc[-1]) else 0.01
     expected_move_pct = float(vol_val * np.sqrt(horizon_steps) * 100.0)
-    lev_val = float(leverage) if (leverage is not None and leverage > 0) else 1.0
 
     direction, action, entry_price, stop_loss, take_profit, rr_ratio, _, four_dim_score = _decide_signal(
         profile=profile,
@@ -947,7 +1013,7 @@ def run_prediction(market: str, raw_symbol: str, target_days=3, leverage=None, c
         ma20_now=ma20_now,
         ma60_now=ma60_now,
         lev_val=lev_val,
-        is_intraday_scalp=is_intraday_scalp,
+        is_short_contract_mode=short_mode,
         lower_wick_ratio=structure_info["lower_wick_ratio"],
         tech_score=tech_info["score"],
         fund_score=fund_info["score"],
@@ -956,13 +1022,24 @@ def run_prediction(market: str, raw_symbol: str, target_days=3, leverage=None, c
         macro_risk_off=macro_info["risk_off"],
     )
 
+    entry_triggers = build_entry_triggers(
+        target_days=target_days,
+        last_price=last_price,
+        ma20_now=ma20_now,
+        ma60_now=ma60_now,
+        high_20=structure_info["high_20"],
+        low_20=structure_info["low_20"],
+        rsi_now=rsi_now,
+        range_pos_pct=structure_info["range_pos_pct"],
+    )
+
     exit_alert = build_exit_alert(
         chg_pct=chg_1d_pct,
         rsi_now=rsi_now,
         range_pos_pct=structure_info["range_pos_pct"],
         upper_wick_ratio=structure_info["upper_wick_ratio"],
         lower_wick_ratio=structure_info["lower_wick_ratio"],
-        is_intraday_scalp=is_intraday_scalp,
+        is_short_contract_mode=short_mode,
         take_profit=take_profit,
         last_price=last_price,
     )
@@ -990,8 +1067,8 @@ def run_prediction(market: str, raw_symbol: str, target_days=3, leverage=None, c
     risk_box = None
     if capital is not None and capital > 0:
         max_risk_amt = capital * profile["max_risk_pct"]
-        stop_dist = abs(entry_price - stop_loss)
-        stop_dist_pct = max(stop_dist / max(entry_price, 1e-8), profile["min_stop_pct"])
+        stop_dist = max(abs(entry_price - stop_loss), entry_price * profile["min_stop_pct"])
+        stop_dist_pct = stop_dist / max(entry_price, 1e-8)
         suggested_notional = min(capital * lev_val, max_risk_amt / stop_dist_pct)
         suggested_units = suggested_notional / entry_price if entry_price > 0 else 0.0
         risk_box = {
@@ -1007,16 +1084,18 @@ def run_prediction(market: str, raw_symbol: str, target_days=3, leverage=None, c
     days_display = f"{target_days:g}"
     win_prob_display = round(blended_prob * 100, 1) if direction == "偏多看漲" else round((1.0 - blended_prob) * 100, 1)
 
-    return {
+    payload = {
         "symbol": symbol,
         "market": market,
         "track_name": profile["track_name"],
         "target_days": days_display,
+        "is_short_contract": short_mode,
         "updated_at": taipei_now,
         "last_price": round(last_price, 4),
         "chg_1d_pct": round(chg_1d_pct, 2),
         "direction": direction,
         "action": action,
+        "entry_triggers": entry_triggers,
         "exit_alert": exit_alert,
         "entry_price": entry_price,
         "rr_ratio": rr_ratio,
@@ -1046,22 +1125,25 @@ def run_prediction(market: str, raw_symbol: str, target_days=3, leverage=None, c
         "news": news_info,
         "risk": risk_box,
     }
+    _SIGNAL_CACHE[cache_key] = {"ts": now_ts, "payload": payload}
+    return payload
 
 
 def run_backtest(market: str, raw_symbol: str, target_days=3, leverage=None):
     raw_days = float(target_days if target_days is not None else 3)
     target_days = max(0.05, min(raw_days, 15.0))
+    short_mode = is_short_term_contract(target_days)
     profile = get_track_profile(market, target_days)
     symbol = normalize_symbol(market, raw_symbol)
-    is_intraday_scalp = (market == "加密貨幣" and target_days < 1.0)
+    use_intraday_bars = (market == "加密貨幣" and short_mode)
     lev_val = float(leverage) if (leverage is not None and leverage > 0) else 1.0
     fee_cost = profile["fee_rate"] * 2.0
     backtest_days = 30
 
-    df = fetch_history_df(symbol, is_intraday_scalp)
-    if (df is None or df.empty or len(df) < 60) and is_intraday_scalp:
+    df = fetch_history_df(symbol, use_intraday_bars)
+    if (df is None or df.empty or len(df) < 60) and use_intraday_bars:
         df = fetch_history_df(symbol, False)
-        is_intraday_scalp = False
+        use_intraday_bars = False
 
     if df is None or df.empty or len(df) < 45:
         raise ValueError(f"{symbol} 歷史 K 線不足，無法執行 30 天回測。")
@@ -1075,7 +1157,7 @@ def run_backtest(market: str, raw_symbol: str, target_days=3, leverage=None):
     if len(df) < 45:
         raise ValueError(f"{symbol} 有效 K 線資料不足。")
 
-    horizon_steps = max(2, int(round(target_days * 24))) if is_intraday_scalp else max(1, int(round(target_days)))
+    horizon_steps = max(2, int(round(target_days * 24))) if use_intraday_bars else max(1, int(round(target_days)))
     horizon_steps = min(horizon_steps, max(1, len(df) // 6))
 
     feat_df = _build_feature_df(df, horizon_steps, profile["target_ret_min"]).dropna(subset=FEATURE_COLS + ["target"]).copy()
@@ -1105,17 +1187,13 @@ def run_backtest(market: str, raw_symbol: str, target_days=3, leverage=None):
     if start_idx >= stop_idx:
         raise ValueError(f"{symbol} 最近 30 天可結算的 K 線不足。")
 
-    if is_intraday_scalp:
-        step_stride = 6 if (stop_idx - start_idx) > 200 else 2
-    else:
-        step_stride = 1
-
+    step_stride = (6 if (stop_idx - start_idx) > 200 else 2) if use_intraday_bars else 1
     window_start_str = str(feat_df.index[start_idx])[:16]
     window_end_str = str(feat_df.index[min(stop_idx, n_rows - 1)])[:16]
 
     trades = []
     signals_evaluated = 0
-    retrain_every = 8 if is_intraday_scalp else 5
+    retrain_every = 8 if use_intraday_bars else 5
     max_eval_steps = 80
     clf = None
     steps_since_fit = 0
@@ -1179,7 +1257,7 @@ def run_backtest(market: str, raw_symbol: str, target_days=3, leverage=None):
                 ma20_now=ma20_now,
                 ma60_now=ma60_now,
                 lev_val=lev_val,
-                is_intraday_scalp=is_intraday_scalp,
+                is_short_contract_mode=short_mode,
                 lower_wick_ratio=lw_ratio,
             )
 
@@ -1218,7 +1296,7 @@ def run_backtest(market: str, raw_symbol: str, target_days=3, leverage=None):
         except Exception:
             continue
 
-    stride_note = f"（1h 每 {step_stride} 根抽樣・每 {retrain_every} 步重訓）" if is_intraday_scalp else ""
+    stride_note = f"（1h 每 {step_stride} 根抽樣・每 {retrain_every} 步重訓）" if use_intraday_bars else ""
 
     if not trades:
         return {
@@ -1228,7 +1306,7 @@ def run_backtest(market: str, raw_symbol: str, target_days=3, leverage=None):
             "backtest_days": backtest_days,
             "window_range": f"{window_start_str} ～ {window_end_str}",
             "leverage": round(lev_val, 2),
-            "timeframe": f"1h K線（近30天極短線{stride_note}）" if is_intraday_scalp else "1d 日線（近30天）",
+            "timeframe": f"1h K線（近30天短線合約{stride_note}）" if use_intraday_bars else "1d 日線（近30天）",
             "bars_tested": signals_evaluated,
             "trade_count": 0,
             "win_rate_pct": 0.0,
@@ -1260,7 +1338,7 @@ def run_backtest(market: str, raw_symbol: str, target_days=3, leverage=None):
         "backtest_days": backtest_days,
         "window_range": f"{window_start_str} ～ {window_end_str}",
         "leverage": round(lev_val, 2),
-        "timeframe": f"1h K線（近30天極短線{stride_note}）" if is_intraday_scalp else "1d 日線（近30天）",
+        "timeframe": f"1h K線（近30天短線合約{stride_note}）" if use_intraday_bars else "1d 日線（近30天）",
         "bars_tested": signals_evaluated,
         "trade_count": int(len(arr)),
         "win_rate_pct": win_rate,
