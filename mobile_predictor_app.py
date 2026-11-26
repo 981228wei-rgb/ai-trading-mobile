@@ -76,7 +76,7 @@ MARKET_PRESETS = {
 
 TRACK_PROFILES = {
     "加密貨幣": {
-        "track_name": "加密貨幣波段/長線軌（預測天數 ≥ 1天・四維濾網）",
+        "track_name": "加密貨幣波段/長線軌（預測天數 ≥ 1天・全維度結構控損）",
         "bull_threshold": 0.58,
         "bear_threshold": 0.42,
         "entry_atr_mult": 0.35,
@@ -89,6 +89,7 @@ TRACK_PROFILES = {
         "extreme_lev": 5.0,
         "extreme_move_pct": 12.0,
         "fee_rate": 0.0005,
+        "allow_short": True,
     },
     "加密貨幣_極短線": {
         "track_name": "加密貨幣短線合約軌（預測天數 < 1天・防軋空緊控損）",
@@ -104,36 +105,71 @@ TRACK_PROFILES = {
         "extreme_lev": 10.0,
         "extreme_move_pct": 5.0,
         "fee_rate": 0.0006,
+        "allow_short": True,
     },
-    "股票": {
-        "track_name": "股票波段/長線軌（預測天數 ≥ 1天・順均線與基本面）",
+    "美股": {
+        "track_name": "美股機構多因子波段軌（預測天數 ≥ 1天・技術/基本/籌碼/宏觀）",
         "bull_threshold": 0.55,
         "bear_threshold": 0.45,
         "entry_atr_mult": 0.30,
         "stop_atr_mult": 1.15,
         "tp_atr_mult": 2.00,
-        "target_ret_min": 0.003,
+        "target_ret_min": 0.004,
         "max_risk_pct": 0.015,
         "min_stop_pct": 0.008,
         "extreme_atr_pct": 0.065,
         "extreme_lev": 3.0,
         "extreme_move_pct": 10.0,
         "fee_rate": 0.0005,
+        "allow_short": True,
     },
-    "股票_短線": {
-        "track_name": "股票短線軌（預測天數 < 1天・嚴控波動與停損）",
+    "美股_短線": {
+        "track_name": "美股機構短線軌（預測天數 < 1天・嚴控波動與流動性）",
         "bull_threshold": 0.57,
         "bear_threshold": 0.43,
         "entry_atr_mult": 0.24,
         "stop_atr_mult": 0.95,
         "tp_atr_mult": 1.75,
-        "target_ret_min": 0.002,
+        "target_ret_min": 0.0025,
         "max_risk_pct": 0.008,
         "min_stop_pct": 0.005,
         "extreme_atr_pct": 0.045,
         "extreme_lev": 5.0,
         "extreme_move_pct": 7.0,
         "fee_rate": 0.0005,
+        "allow_short": True,
+    },
+    "台股": {
+        "track_name": "台股機構全維度順勢軌（僅做多・不做空單・基本/籌碼/技術/宏觀）",
+        "bull_threshold": 0.55,
+        "bear_threshold": 0.45,
+        "entry_atr_mult": 0.30,
+        "stop_atr_mult": 1.15,
+        "tp_atr_mult": 2.05,
+        "target_ret_min": 0.004,
+        "max_risk_pct": 0.015,
+        "min_stop_pct": 0.008,
+        "extreme_atr_pct": 0.065,
+        "extreme_lev": 2.5,
+        "extreme_move_pct": 9.5,
+        "fee_rate": 0.001425,
+        "allow_short": False,
+    },
+    "台股_短線": {
+        "track_name": "台股短線顺勢軌（僅做多・不做空單・嚴控回測與跳空風險）",
+        "bull_threshold": 0.57,
+        "bear_threshold": 0.43,
+        "entry_atr_mult": 0.24,
+        "stop_atr_mult": 0.95,
+        "tp_atr_mult": 1.80,
+        "target_ret_min": 0.0025,
+        "max_risk_pct": 0.008,
+        "min_stop_pct": 0.005,
+        "extreme_atr_pct": 0.045,
+        "extreme_lev": 3.0,
+        "extreme_move_pct": 7.0,
+        "fee_rate": 0.001425,
+        "allow_short": False,
     },
 }
 
@@ -147,13 +183,19 @@ def get_track_profile(market: str, target_days: float) -> dict:
     short_mode = is_short_term_contract(target_days)
     if market == "加密貨幣":
         return TRACK_PROFILES["加密貨幣_極短線"] if short_mode else TRACK_PROFILES["加密貨幣"]
-    return TRACK_PROFILES["股票_短線"] if short_mode else TRACK_PROFILES["股票"]
+    if market == "台股":
+        return TRACK_PROFILES["台股_短線"] if short_mode else TRACK_PROFILES["台股"]
+    return TRACK_PROFILES["美股_短線"] if short_mode else TRACK_PROFILES["美股"]
 
 
 def normalize_symbol(market: str, raw_symbol: str) -> str:
     sym = (raw_symbol or "").strip().upper()
     if not sym:
-        return "BTC-USD" if market == "加密貨幣" else "NVDA"
+        if market == "加密貨幣":
+            return "BTC-USD"
+        if market == "台股":
+            return "2330.TW"
+        return "NVDA"
     if market == "加密貨幣":
         if "-" not in sym and not sym.endswith("USD"):
             return f"{sym}-USD"
@@ -245,7 +287,113 @@ def analyze_price_structure(df: pd.DataFrame, last_price: float, range_label: st
     }
 
 
+def fetch_chip_and_flow_context(market: str, symbol: str, df: pd.DataFrame, macro_info: dict, news_score: float) -> dict:
+    """
+    第五維／籌碼與市場結構面：
+    - 台股：整合外資／投信／三大法人與融資借券氛圍、量價結構、大盤連動（TWII）與限空流動性環境
+    - 美股：整合機構風險偏好／去槓桿與擴散環境、量能結構、SPY 市場廣度代理指標
+    - 加密貨幣：整合槓桿波動與量價結構
+    """
+    vol_ratio_now = float(df["vol_ratio"].iloc[-1]) if "vol_ratio" in df.columns and pd.notna(df["vol_ratio"].iloc[-1]) else 1.0
+    ret_5d_now = float(df["ret_5d"].iloc[-1]) if "ret_5d" in df.columns and pd.notna(df["ret_5d"].iloc[-1]) else 0.0
+
+    if market == "台股":
+        twii_val, twii_chg = _safe_last_and_chg("^TWII")
+        score = 0.0
+        notes = []
+
+        if twii_val is not None:
+            if twii_chg >= 0.8:
+                score += 0.25
+                notes.append(f"加權指數走強 ({twii_chg:+.2f}%) 法人偏多回補")
+            elif twii_chg <= -1.2:
+                score -= 0.30
+                notes.append(f"加權指數重挫 ({twii_chg:+.2f}%) 留意融資與法人調節")
+            else:
+                notes.append(f"加權指數 {twii_val:.0f} ({twii_chg:+.2f}%)")
+
+        if vol_ratio_now >= 1.35 and ret_5d_now > 0:
+            score += 0.20
+            notes.append(f"量能放大 ({vol_ratio_now:.2f}x) 吸籌動能較佳")
+        elif vol_ratio_now < 0.75:
+            score -= 0.10
+            notes.append(f"量能偏縮 ({vol_ratio_now:.2f}x) 追價力道保守")
+
+        if news_score >= 0.15:
+            score += 0.10
+            notes.append("題材與法人買盤預期偏正面")
+        elif news_score <= -0.15:
+            score -= 0.15
+            notes.append("消息面偏空，留意投信/外資換手與借券壓力")
+
+        score = float(np.clip(score, -1.0, 1.0))
+        status = "籌碼與量價偏多（吸籌/順勢）" if score >= 0.20 else ("籌碼與流動性偏緊（防調節）" if score <= -0.20 else "籌碼與量價中性")
+        return {
+            "score": round(score, 3),
+            "status": status,
+            "summary": "｜".join(notes) if notes else "台股籌碼與量價中性",
+            "short_allowed": False,
+        }
+
+    if market == "美股":
+        spy_val, spy_chg = _safe_last_and_chg("SPY")
+        score = 0.0
+        notes = []
+
+        if spy_val is not None:
+            if spy_chg >= 0.6:
+                score += 0.20
+                notes.append(f"SPY 走揚 ({spy_chg:+.2f}%) 機構風險偏好回升")
+            elif spy_chg <= -1.0:
+                score -= 0.25
+                notes.append(f"SPY 回檔 ({spy_chg:+.2f}%) 留意對沖基金去槓桿/擴散")
+            else:
+                notes.append(f"SPY {spy_val:.2f} ({spy_chg:+.2f}%)")
+
+        if macro_info.get("risk_off"):
+            score -= 0.25
+            notes.append("宏觀風險升溫，機構部位偏向防禦與減槓桿")
+
+        if vol_ratio_now >= 1.4 and ret_5d_now > 0.01:
+            score += 0.15
+            notes.append(f"成交量放大 ({vol_ratio_now:.2f}x) 資金流入明確")
+        elif vol_ratio_now >= 1.5 and ret_5d_now < -0.02:
+            score -= 0.20
+            notes.append(f"放量下跌 ({vol_ratio_now:.2f}x) 機構派發/去槓桿壓力")
+
+        score = float(np.clip(score, -1.0, 1.0))
+        status = "機構資金偏多" if score >= 0.20 else ("機構去槓桿/防禦警戒" if score <= -0.20 else "機構籌碼中性")
+        return {
+            "score": round(score, 3),
+            "status": status,
+            "summary": "｜".join(notes) if notes else "美股機構與量能結構中性",
+            "short_allowed": True,
+        }
+
+    # 加密貨幣市場結構與量能
+    score = 0.0
+    notes = []
+    if vol_ratio_now >= 1.45 and ret_5d_now > 0.02:
+        score += 0.20
+        notes.append(f"成交量放大 ({vol_ratio_now:.2f}x) 動能推升")
+    elif vol_ratio_now >= 1.45 and ret_5d_now < -0.02:
+        score -= 0.20
+        notes.append(f"放量下殺 ({vol_ratio_now:.2f}x) 留意清算與洗盤")
+    else:
+        notes.append(f"量能比 {vol_ratio_now:.2f}x")
+
+    score = float(np.clip(score, -1.0, 1.0))
+    status = "量能動能偏多" if score >= 0.20 else ("洗盤/清算壓力偏高" if score <= -0.20 else "量能結構中性")
+    return {
+        "score": round(score, 3),
+        "status": status,
+        "summary": "｜".join(notes),
+        "short_allowed": True,
+    }
+
+
 def build_entry_triggers(
+    market: str,
     target_days: float,
     last_price: float,
     ma20_now: float,
@@ -254,10 +402,29 @@ def build_entry_triggers(
     low_20: float,
     rsi_now: float,
     range_pos_pct: float,
+    allow_short: bool,
 ) -> dict:
-    """不管長線或短線，都直接給出開多、開空與觀望的具體訊號條件。"""
+    """不管長線或短線，都直接給出開多、開空（台股明確不做空）與觀望的具體訊號條件。"""
     short_mode = is_short_term_contract(target_days)
-    mode_label = "短線合約（< 1天）" if short_mode else "波段／長線（≥ 1天）"
+    mode_label = f"{market}・{'短線（< 1天）' if short_mode else '波段／長線（≥ 1天）'}"
+
+    if market == "台股":
+        long_signal = (
+            f"站穩 {ma20_now:.4f} 或回測 {ma20_now:.4f}／{ma60_now:.4f} 支撐守穩不破、出現下影線或止跌紅K收盤，"
+            f"且量價與法人/基本面結構偏多（目前區間 {range_pos_pct:.1f}%、RSI {rsi_now:.1f}），再考慮分批偏多。"
+        )
+        short_signal = "台股策略設定為「僅做多、不做空單」：遇跌破支撐或高檔轉弱時一律減碼／觀望，不開空單。"
+        wait_signal = (
+            f"股價卡在 {low_20:.4f} ～ {high_20:.4f} 中段震盪、量縮或尚未守穩關鍵均線時先別開單，等支撐確認再出手。"
+        )
+        return {
+            "is_short_contract": short_mode,
+            "horizon_category": mode_label,
+            "allow_short": False,
+            "long_signal": long_signal,
+            "short_signal": short_signal,
+            "wait_signal": wait_signal,
+        }
 
     if short_mode:
         long_signal = (
@@ -273,11 +440,11 @@ def build_entry_triggers(
         )
     else:
         long_signal = (
-            f"日線結構站穩 {ma20_now:.4f} 上方，或回踩 {ma20_now:.4f}／{ma60_now:.4f} 趨勢支撐區止跌收紅、"
-            f"區間位置不過熱（目前 {range_pos_pct:.1f}%，RSI {rsi_now:.1f}），再分批偏多布局。"
+            f"趨勢結構站穩 {ma20_now:.4f} 上方，或回踩 {ma20_now:.4f}／{ma60_now:.4f} 支撐區止跌收紅、"
+            f"估值與區間位置不過熱（目前 {range_pos_pct:.1f}%，RSI {rsi_now:.1f}），再分批偏多布局。"
         )
         short_signal = (
-            f"日線跌破 {ma20_now:.4f} 且反彈受阻轉弱，或靠近 {high_20:.4f} 阻力區出現明顯上影線／動能背離且跌勢確認，"
+            f"跌破 {ma20_now:.4f} 且反彈受阻轉弱，或靠近 {high_20:.4f} 阻力區出現明顯上影線／動能背離且跌勢確認，"
             f"不逆勢硬空底部或強勢多頭排列，再考慮偏空操作。"
         )
         wait_signal = (
@@ -287,6 +454,7 @@ def build_entry_triggers(
     return {
         "is_short_contract": short_mode,
         "horizon_category": mode_label,
+        "allow_short": allow_short,
         "long_signal": long_signal,
         "short_signal": short_signal,
         "wait_signal": wait_signal,
@@ -302,6 +470,7 @@ def build_exit_alert(
     is_short_contract_mode: bool,
     take_profit: float,
     last_price: float,
+    allow_short: bool = True,
 ) -> dict:
     spike_thresh = 1.8 if is_short_contract_mode else 3.5
     if (
@@ -313,7 +482,7 @@ def build_exit_alert(
             "title": "多單留意分批止盈／上移停利",
             "reason": f"處於區間高檔或急拉後出現上影線賣壓（區間 {range_pos_pct:.1f}%、上影線 {upper_wick_ratio*100:.0f}%、RSI {rsi_now:.1f}），漲勢若停滯建議先減碼鎖利，目標參考 {take_profit}。",
         }
-    if range_pos_pct <= 22.0 and (lower_wick_ratio >= 0.35 or rsi_now <= 32.0):
+    if allow_short and range_pos_pct <= 22.0 and (lower_wick_ratio >= 0.35 or rsi_now <= 32.0):
         return {
             "level": "medium",
             "title": "空單留意回補止盈／防反彈",
@@ -748,7 +917,37 @@ def _evaluate_time_series_cv(X: pd.DataFrame, y: pd.Series) -> float:
     return float(np.mean(scores)) if scores else 0.5
 
 
+def _compute_composite_score(market: str, tech_score: float, fund_score: float, sent_score: float, macro_score: float, flow_score: float) -> float:
+    """台股、美股、加密貨幣各自採用不同的全維度加權。"""
+    if market == "台股":
+        raw = (
+            tech_score * 0.25
+            + fund_score * 0.25
+            + flow_score * 0.25
+            + macro_score * 0.15
+            + sent_score * 0.10
+        )
+    elif market == "美股":
+        raw = (
+            tech_score * 0.25
+            + fund_score * 0.20
+            + flow_score * 0.20
+            + macro_score * 0.20
+            + sent_score * 0.15
+        )
+    else:
+        raw = (
+            tech_score * 0.35
+            + flow_score * 0.20
+            + macro_score * 0.20
+            + sent_score * 0.15
+            + fund_score * 0.10
+        )
+    return round(float(np.clip(raw, -1.0, 1.0)), 3)
+
+
 def _decide_signal(
+    market: str,
     profile: dict,
     prob_up: float,
     blended_prob: float,
@@ -770,14 +969,20 @@ def _decide_signal(
     fund_score: float = 0.0,
     sent_score: float = 0.0,
     macro_score: float = 0.0,
+    flow_score: float = 0.0,
     macro_risk_off: bool = False,
 ):
     chg_pct = ((last_price - prev_price) / prev_price * 100.0) if prev_price else 0.0
     atr_pct_now = atr_val / max(last_price, 1e-8)
+    allow_short = bool(profile.get("allow_short", True)) and (market != "台股")
 
-    four_dim_score = round(
-        tech_score * 0.35 + fund_score * 0.20 + sent_score * 0.20 + macro_score * 0.25,
-        3,
+    composite_score = _compute_composite_score(
+        market=market,
+        tech_score=tech_score,
+        fund_score=fund_score,
+        sent_score=sent_score,
+        macro_score=macro_score,
+        flow_score=flow_score,
     )
 
     uptrend_ma_stack = (last_price > ma20_now) and (ma20_now > ma60_now)
@@ -805,7 +1010,7 @@ def _decide_signal(
         and abs(news_score) >= 0.25
         and ((news_score > 0 and prob_up < 0.48) or (news_score < 0 and prob_up > 0.52))
     )
-    macro_headwind_block_long = macro_risk_off and (four_dim_score < 0.05) and (range_pos_pct > 20.0)
+    macro_headwind_block_long = macro_risk_off and (composite_score < 0.05) and (range_pos_pct > 20.0)
 
     entry_mult = profile["entry_atr_mult"]
     stop_mult = profile["stop_atr_mult"]
@@ -828,8 +1033,8 @@ def _decide_signal(
     elif spike_whipsaw:
         direction = "急動插針先等收穩"
         entry_price = round(last_price - np.sign(chg_pct) * max(entry_mult * 1.3, 0.35) * atr_val, 4)
-        stop_loss = round(entry_price - stop_mult * atr_val, 4) if chg_pct < 0 else round(entry_price + stop_mult * atr_val, 4)
-        take_profit = round(entry_price + tp_mult * atr_val, 4) if chg_pct < 0 else round(entry_price - tp_mult * atr_val, 4)
+        stop_loss = round(entry_price - stop_mult * atr_val, 4) if (chg_pct < 0 or not allow_short) else round(entry_price + stop_mult * atr_val, 4)
+        take_profit = round(entry_price + tp_mult * atr_val, 4) if (chg_pct < 0 or not allow_short) else round(entry_price - tp_mult * atr_val, 4)
         rr_ratio = round(tp_mult / max(stop_mult, 1e-8), 2)
         action = f"短線急動易有第一根假針，不追單，等K線收穩再看 {entry_price} 附近"
     elif spike_fade_risk and blended_prob >= profile["bull_threshold"]:
@@ -863,24 +1068,32 @@ def _decide_signal(
             entry_hint = f"假跌破收回或二探有止跌跡象，可評估現價 {entry_price} 附近分批" if sweep_and_reclaim else f"處於低檔止跌區，可評估現價 {entry_price} 附近進場"
         else:
             entry_price = round(last_price - max(entry_mult, 0.25) * atr_val, 4)
-            entry_hint = f"四維偏多（綜合 {four_dim_score:+.2f}），防衝高假突破，等回測 {entry_price} 掛單"
+            entry_hint = f"全維度偏多（綜合 {composite_score:+.2f}），防衝高假突破，等回測 {entry_price} 掛單"
         stop_loss = round(entry_price - stop_mult * atr_val, 4)
         take_profit = round(entry_price + tp_mult * atr_val, 4)
         rr_ratio = round(max(take_profit - entry_price, 0.0) / max(entry_price - stop_loss, 1e-8), 2)
         action = f"{entry_hint}（停損 {stop_mult:.2f} ATR / 停利 {tp_mult:.2f} ATR，盈虧比 1:{rr_ratio}）"
-    elif blended_prob <= profile["bear_threshold"] and not short_squeeze_or_bounce_risk:
+    elif blended_prob <= profile["bear_threshold"] and not allow_short:
+        # 台股不做空單：空方訊號一律轉為觀望／等支撐止跌
+        direction = "台股不做空（觀望等支撐）"
+        entry_price = round(last_price - max(entry_mult * 1.35, 0.35) * atr_val, 4)
+        stop_loss = round(entry_price - stop_mult * atr_val, 4)
+        take_profit = round(entry_price + tp_mult * atr_val, 4)
+        rr_ratio = round(max(take_profit - entry_price, 0.0) / max(entry_price - stop_loss, 1e-8), 2)
+        action = f"台股設定為不做空單，目前偏弱/震盪整理（綜合 {composite_score:+.2f}），不開空，等回測 {entry_price} 附近止跌再評估偏多"
+    elif blended_prob <= profile["bear_threshold"] and allow_short and not short_squeeze_or_bounce_risk:
         direction = "偏空看跌"
         if range_pos_pct >= 85.0 and rsi_now >= 70.0 and chg_pct <= 0.2:
             entry_price = round(last_price, 4)
             entry_hint = f"處於高檔轉弱區，反彈不戀戰，可評估現價 {entry_price} 附近偏空"
         else:
             entry_price = round(last_price + max(entry_mult * 1.15, 0.30) * atr_val, 4)
-            entry_hint = f"四維偏空（綜合 {four_dim_score:+.2f}），防短線反彈軋空，等反彈受阻至 {entry_price} 再評估"
+            entry_hint = f"全維度偏空（綜合 {composite_score:+.2f}），防短線反彈軋空，等反彈受阻至 {entry_price} 再評估"
         stop_loss = round(entry_price + stop_mult * atr_val, 4)
         take_profit = round(entry_price - tp_mult * atr_val, 4)
         rr_ratio = round(max(entry_price - take_profit, 0.0) / max(stop_loss - entry_price, 1e-8), 2)
         action = f"{entry_hint}（停損 {stop_mult:.2f} ATR / 停利 {tp_mult:.2f} ATR，盈虧比 1:{rr_ratio}）"
-    elif blended_prob <= profile["bear_threshold"] and short_squeeze_or_bounce_risk:
+    elif blended_prob <= profile["bear_threshold"] and allow_short and short_squeeze_or_bounce_risk:
         direction = "防反彈軋空（不追空）"
         entry_price = round(last_price + max(entry_mult * 1.35, 0.45) * atr_val, 4)
         stop_loss = round(entry_price + stop_mult * atr_val, 4)
@@ -896,9 +1109,10 @@ def _decide_signal(
         stop_loss = round(entry_price - stop_mult * atr_val, 4)
         take_profit = round(entry_price + tp_mult * atr_val, 4)
         rr_ratio = round(tp_mult / max(stop_mult, 1e-8), 2)
-        action = f"四維綜合 {four_dim_score:+.2f}（區間磨底/上下洗盤，控管槓桿與倉位），參考點位 {entry_price}（盈虧比 1:{rr_ratio}）"
+        no_short_note = "（台股不做空）" if not allow_short else ""
+        action = f"全維度綜合 {composite_score:+.2f}{no_short_note}（區間磨底/上下洗盤，控管槓桿與倉位），參考點位 {entry_price}（盈虧比 1:{rr_ratio}）"
 
-    return direction, action, entry_price, stop_loss, take_profit, rr_ratio, chg_pct, four_dim_score
+    return direction, action, entry_price, stop_loss, take_profit, rr_ratio, chg_pct, composite_score
 
 
 def run_prediction(market: str, raw_symbol: str, target_days=3, leverage=None, capital=None):
@@ -984,20 +1198,24 @@ def run_prediction(market: str, raw_symbol: str, target_days=3, leverage=None, c
     fund_info = fetch_fundamental_context(market, symbol, prob_up, ma20_gap_now)
     tech_info = score_technical(prob_up, ma20_now, ma60_now, last_price, rsi_now, structure_info["range_pos_pct"])
     sent_info = score_sentiment(news_info["score"], rsi_now, chg_1d_pct)
+    flow_info = fetch_chip_and_flow_context(market, symbol, feat_df, macro_info, news_info["score"])
 
-    four_dim_raw = (
-        tech_info["score"] * 0.35
-        + fund_info["score"] * 0.20
-        + sent_info["score"] * 0.20
-        + macro_info["score"] * 0.25
+    composite_raw = _compute_composite_score(
+        market=market,
+        tech_score=tech_info["score"],
+        fund_score=fund_info["score"],
+        sent_score=sent_info["score"],
+        macro_score=macro_info["score"],
+        flow_score=flow_info["score"],
     )
-    blended_prob = float(np.clip(prob_up + four_dim_raw * 0.14, 0.08, 0.92))
+    blended_prob = float(np.clip(prob_up + composite_raw * 0.14, 0.08, 0.92))
 
     atr_val = float(feat_df["atr14"].iloc[-1]) if pd.notna(feat_df["atr14"].iloc[-1]) else last_price * 0.01
     vol_val = float(feat_df["vol_20"].iloc[-1]) if pd.notna(feat_df["vol_20"].iloc[-1]) else 0.01
     expected_move_pct = float(vol_val * np.sqrt(horizon_steps) * 100.0)
 
-    direction, action, entry_price, stop_loss, take_profit, rr_ratio, _, four_dim_score = _decide_signal(
+    direction, action, entry_price, stop_loss, take_profit, rr_ratio, _, composite_score = _decide_signal(
+        market=market,
         profile=profile,
         prob_up=prob_up,
         blended_prob=blended_prob,
@@ -1019,10 +1237,13 @@ def run_prediction(market: str, raw_symbol: str, target_days=3, leverage=None, c
         fund_score=fund_info["score"],
         sent_score=sent_info["score"],
         macro_score=macro_info["score"],
+        flow_score=flow_info["score"],
         macro_risk_off=macro_info["risk_off"],
     )
 
+    allow_short = bool(profile.get("allow_short", True)) and (market != "台股")
     entry_triggers = build_entry_triggers(
+        market=market,
         target_days=target_days,
         last_price=last_price,
         ma20_now=ma20_now,
@@ -1031,6 +1252,7 @@ def run_prediction(market: str, raw_symbol: str, target_days=3, leverage=None, c
         low_20=structure_info["low_20"],
         rsi_now=rsi_now,
         range_pos_pct=structure_info["range_pos_pct"],
+        allow_short=allow_short,
     )
 
     exit_alert = build_exit_alert(
@@ -1042,21 +1264,23 @@ def run_prediction(market: str, raw_symbol: str, target_days=3, leverage=None, c
         is_short_contract_mode=short_mode,
         take_profit=take_profit,
         last_price=last_price,
+        allow_short=allow_short,
     )
 
     news_score_val = news_info["score"]
     high_lev_short_blocked = (direction == "偏空看跌") and (lev_val >= 10.0) and (chg_1d_pct > -0.35 or structure_info["lower_wick_ratio"] >= 0.25)
-    news_aligned_bull = (blended_prob >= 0.65) and (news_score_val >= -0.10) and (prob_up >= 0.60) and (four_dim_score >= 0.12)
+    news_aligned_bull = (blended_prob >= 0.65) and (news_score_val >= -0.10) and (prob_up >= 0.60) and (composite_score >= 0.12)
     news_aligned_bear = (
-        (direction == "偏空看跌")
+        allow_short
+        and (direction == "偏空看跌")
         and (not high_lev_short_blocked)
         and (blended_prob <= 0.35)
         and (news_score_val <= 0.10)
         and (prob_up <= 0.40)
-        and (four_dim_score <= -0.12)
+        and (composite_score <= -0.12)
     )
     high_win_qualified = (
-        direction in ("偏多看漲", "偏空看跌")
+        ((direction == "偏多看漲") or (allow_short and direction == "偏空看跌"))
         and test_acc >= 0.56
         and rr_ratio >= 1.50
         and (news_aligned_bull or news_aligned_bear)
@@ -1090,6 +1314,7 @@ def run_prediction(market: str, raw_symbol: str, target_days=3, leverage=None, c
         "track_name": profile["track_name"],
         "target_days": days_display,
         "is_short_contract": short_mode,
+        "allow_short": allow_short,
         "updated_at": taipei_now,
         "last_price": round(last_price, 4),
         "chg_1d_pct": round(chg_1d_pct, 2),
@@ -1102,12 +1327,14 @@ def run_prediction(market: str, raw_symbol: str, target_days=3, leverage=None, c
         "win_prob_display": win_prob_display,
         "high_win_qualified": high_win_qualified,
         "edge_score": edge_score,
-        "four_dim_score": four_dim_score,
+        "four_dim_score": composite_score,
+        "composite_score": composite_score,
         "dimensions": {
             "technical": tech_info,
             "fundamental": fund_info,
             "sentiment": sent_info,
             "macro": macro_info,
+            "chip_flow": flow_info,
         },
         "ml_prob_up": round(prob_up * 100, 1),
         "blended_prob_up": round(blended_prob * 100, 1),
@@ -1139,6 +1366,7 @@ def run_backtest(market: str, raw_symbol: str, target_days=3, leverage=None):
     lev_val = float(leverage) if (leverage is not None and leverage > 0) else 1.0
     fee_cost = profile["fee_rate"] * 2.0
     backtest_days = 30
+    allow_short = bool(profile.get("allow_short", True)) and (market != "台股")
 
     df = fetch_history_df(symbol, use_intraday_bars)
     if (df is None or df.empty or len(df) < 60) and use_intraday_bars:
@@ -1242,6 +1470,7 @@ def run_backtest(market: str, raw_symbol: str, target_days=3, leverage=None):
             range_pos_pct = float(np.clip((last_price - low_20) / max(high_20 - low_20, 1e-8) * 100.0, 0.0, 100.0))
 
             direction, _, entry_price, stop_loss, take_profit, _, _, _ = _decide_signal(
+                market=market,
                 profile=profile,
                 prob_up=prob_up,
                 blended_prob=blended_prob,
@@ -1261,7 +1490,8 @@ def run_backtest(market: str, raw_symbol: str, target_days=3, leverage=None):
                 lower_wick_ratio=lw_ratio,
             )
 
-            if direction not in ("偏多看漲", "偏空看跌"):
+            valid_dirs = ("偏多看漲", "偏空看跌") if allow_short else ("偏多看漲",)
+            if direction not in valid_dirs:
                 continue
 
             future_bars = feat_df.iloc[idx + 1: idx + 1 + horizon_steps]
@@ -1297,6 +1527,7 @@ def run_backtest(market: str, raw_symbol: str, target_days=3, leverage=None):
             continue
 
     stride_note = f"（1h 每 {step_stride} 根抽樣・每 {retrain_every} 步重訓）" if use_intraday_bars else ""
+    short_policy_note = "（台股僅回測偏多單，不做空）" if not allow_short else ""
 
     if not trades:
         return {
@@ -1306,14 +1537,14 @@ def run_backtest(market: str, raw_symbol: str, target_days=3, leverage=None):
             "backtest_days": backtest_days,
             "window_range": f"{window_start_str} ～ {window_end_str}",
             "leverage": round(lev_val, 2),
-            "timeframe": f"1h K線（近30天短線合約{stride_note}）" if use_intraday_bars else "1d 日線（近30天）",
+            "timeframe": f"1h K線（近30天短線合約{stride_note}）" if use_intraday_bars else f"1d 日線（近30天{short_policy_note}）",
             "bars_tested": signals_evaluated,
             "trade_count": 0,
             "win_rate_pct": 0.0,
             "avg_return_pct": 0.0,
             "profit_factor": 0.0,
             "max_drawdown_pct": 0.0,
-            "note": f"近 30 天（{window_start_str} ～ {window_end_str}）內符合進場條件的訊號較少。",
+            "note": f"近 30 天（{window_start_str} ～ {window_end_str}）內符合進場條件的訊號較少{short_policy_note}。",
         }
 
     arr = np.array(trades, dtype=float)
@@ -1338,14 +1569,14 @@ def run_backtest(market: str, raw_symbol: str, target_days=3, leverage=None):
         "backtest_days": backtest_days,
         "window_range": f"{window_start_str} ～ {window_end_str}",
         "leverage": round(lev_val, 2),
-        "timeframe": f"1h K線（近30天短線合約{stride_note}）" if use_intraday_bars else "1d 日線（近30天）",
+        "timeframe": f"1h K線（近30天短線合約{stride_note}）" if use_intraday_bars else f"1d 日線（近30天{short_policy_note}）",
         "bars_tested": signals_evaluated,
         "trade_count": int(len(arr)),
         "win_rate_pct": win_rate,
         "avg_return_pct": avg_ret,
         "profit_factor": profit_factor,
         "max_drawdown_pct": max_dd_pct,
-        "note": f"回測區間：{window_start_str} ～ {window_end_str}（近{backtest_days}天{stride_note}，含雙邊手續費 {fee_cost * 100:.2f}% 與 {lev_val:g}x 槓桿）。",
+        "note": f"回測區間：{window_start_str} ～ {window_end_str}（近{backtest_days}天{stride_note}，含雙邊成本 {fee_cost * 100:.2f}% 與 {lev_val:g}x 槓桿{short_policy_note}）。",
     }
 
 
@@ -1425,7 +1656,7 @@ def api_recommend():
             "market": market,
             "target_days": f"{max(0.05, min(days, 15.0)):g}",
             "checked_at": datetime.now(ZoneInfo("Asia/Taipei")).strftime("%Y-%m-%d %H:%M:%S"),
-            "criteria": "方向機率 ≥65%（或 ≤35% 且防軋空/高槓桿保護）＋ 驗證準確 ≥56% ＋ 盈虧比 ≥1.5 ＋ 四維與新聞不打架",
+            "criteria": "方向機率 ≥65%（或 ≤35% 且防軋空/高槓桿保護）＋ 驗證準確 ≥56% ＋ 盈虧比 ≥1.5 ＋ 全維度與新聞不打架",
             "recommendations": recs,
         })
     except Exception as exc:
